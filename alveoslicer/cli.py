@@ -6,7 +6,7 @@ import argparse
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .config import SlicerConfig
+from .config import CELL_PATTERNS, SlicerConfig
 from .geometry import create_test_curved_wall_mesh, create_test_sphere_mesh, load_and_center_mesh
 from .pipeline import run_slicer
 
@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dump-default-config", type=Path, help="Write default JSON config and exit")
     parser.add_argument("--printer-type", choices=["bedslinger_prototype", "corexy_toolchanger"])
     parser.add_argument("--infill-mode", choices=["hollow_shell", "full_to_medial"])
-    parser.add_argument("--pattern", choices=["voronoi", "hexagonal"])
+    parser.add_argument("--pattern", choices=list(CELL_PATTERNS))
     parser.add_argument("--flatten-angle", type=float, help="Flatten faces tilted < angle (deg) to horizontal")
     parser.add_argument(
         "--fff-only",

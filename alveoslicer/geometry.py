@@ -153,6 +153,118 @@ class VolumetricField:
         self.sdf = dist_out - self.dist_in
 
 
+def clean_geom(geom: shapely.Geometry) -> shapely.Geometry:
+    """Repair invalid or self-touching Shapely geometries so GEOS boolean ops never fail."""
+    if geom is None or geom.is_empty:
+        return Polygon()
+    try:
+        if not geom.is_valid:
+            geom = shapely.make_valid(geom)
+    except Exception:
+        try:
+            geom = geom.buffer(0)
+        except Exception:
+            return Polygon()
+    if geom is None or geom.is_empty:
+        return Polygon()
+    return geom
+
+
+def safe_buffer(geom: shapely.Geometry, dist: float, **kwargs) -> shapely.Geometry:
+    """Topology-safe Shapely buffer with automatic make_valid + precision fallback."""
+    if geom is None or geom.is_empty:
+        return Polygon()
+    try:
+        res = geom.buffer(dist, **kwargs)
+        return clean_geom(res)
+    except Exception:
+        g = clean_geom(geom)
+        if g.is_empty:
+            return Polygon()
+        try:
+            return clean_geom(g.buffer(dist, **kwargs))
+        except Exception:
+            try:
+                g_p = shapely.set_precision(g, 1e-4)
+                return clean_geom(g_p.buffer(dist, **kwargs))
+            except Exception:
+                return Polygon()
+
+
+def safe_union(geoms: List[shapely.Geometry]) -> shapely.Geometry:
+    """Topology-safe unary_union with automatic repair and precision-grid fallback."""
+    valid_list = [g for g in geoms if g is not None and not g.is_empty]
+    if not valid_list:
+        return Polygon()
+    if len(valid_list) == 1:
+        return clean_geom(valid_list[0])
+    try:
+        return clean_geom(shapely.unary_union(valid_list))
+    except Exception:
+        repaired = [clean_geom(g) for g in valid_list]
+        repaired = [g for g in repaired if not g.is_empty]
+        if not repaired:
+            return Polygon()
+        try:
+            return clean_geom(shapely.unary_union(repaired))
+        except Exception:
+            try:
+                snapped = [shapely.set_precision(g, 1e-4) for g in repaired]
+                return clean_geom(shapely.unary_union(snapped))
+            except Exception:
+                acc = repaired[0]
+                for g in repaired[1:]:
+                    try:
+                        acc = clean_geom(acc.union(g))
+                    except Exception:
+                        continue
+                return acc
+
+
+def safe_intersection(a: shapely.Geometry, b: shapely.Geometry) -> shapely.Geometry:
+    """Topology-safe Shapely intersection (never throws TopologyException)."""
+    if a is None or b is None or a.is_empty or b.is_empty:
+        return Polygon()
+    try:
+        return a.intersection(b)
+    except Exception:
+        ca, cb = clean_geom(a), clean_geom(b)
+        if ca.is_empty or cb.is_empty:
+            return Polygon()
+        try:
+            return ca.intersection(cb)
+        except Exception:
+            try:
+                return shapely.set_precision(ca, 1e-4).intersection(shapely.set_precision(cb, 1e-4))
+            except Exception:
+                return Polygon()
+
+
+def safe_difference(a: shapely.Geometry, b: shapely.Geometry) -> shapely.Geometry:
+    """Topology-safe Shapely difference (never throws TopologyException)."""
+    if a is None or a.is_empty:
+        return Polygon()
+    if b is None or b.is_empty:
+        return clean_geom(a)
+    try:
+        return clean_geom(a.difference(b))
+    except Exception:
+        ca, cb = clean_geom(a), clean_geom(b)
+        if ca.is_empty:
+            return Polygon()
+        if cb.is_empty:
+            return ca
+        try:
+            return clean_geom(ca.difference(cb))
+        except Exception:
+            try:
+                return clean_geom(
+                    shapely.set_precision(ca, 1e-4).difference(shapely.set_precision(cb, 1e-4))
+                )
+            except Exception:
+                return ca
+
+
 def extract_polylines(geom: shapely.Geometry) -> List[np.ndarray]:
     """Extract all 2D polyline coordinate arrays from a Shapely geometry."""
     lines: List[np.ndarray] = []

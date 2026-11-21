@@ -57,19 +57,37 @@ def slice_mesh(
         if on_log is not None:
             on_log(msg)
 
-    _progress(5, "Stage 1: Building lightweight 3D surface field...")
-    _log(f"[Stage 1] Building lightweight surface field (pitch={cfg.voxel_pitch_mm} mm)...")
-    field = VolumetricField(mesh, pitch=cfg.voxel_pitch_mm)
+    if str(cfg.infill.infill_engine).lower() == "standard":
+        from .infill import NormalVoronoiLattice
 
-    _progress(22, "Stage 2-3: Synthesizing 3D surface-normal cellular infill...")
-    _log(
-        f"[Stage 2-3] Synthesizing 3D outer-surface {cfg.infill.pattern} pattern "
-        f"(mode={cfg.infill.mode}, pitch={cfg.infill.target_cell_pitch} mm, "
-        f"resin_channel={cfg.infill.min_channel_clearance} mm, "
-        f"flatten_angle=<{cfg.infill.flatten_angle_deg} deg)..."
-    )
-    lattice = generate_normal_dendritic_infill(field, cfg)
-    _log(f"            Placed {len(lattice.seeds)} cells ({len(lattice)} 3D wireframe edges).")
+        _progress(22, "Stage 2-3: Preparing Standard PrusaSlicer Infill engine...")
+        _log(
+            f"[Stage 2-3] Using Standard PrusaSlicer Infill engine "
+            f"(pattern={cfg.infill.standard_fill_pattern}, density={cfg.infill.fill_density_pct:.1f}%)..."
+        )
+        field = VolumetricField(mesh, pitch=max(1.2, cfg.voxel_pitch_mm))
+        lattice = NormalVoronoiLattice(
+            capsules=[],
+            seeds=np.zeros((0, 3), dtype=np.float64),
+            cell_planes=[],
+            seed_z_bounds=np.zeros((0, 2), dtype=np.float64),
+            pattern=cfg.infill.standard_fill_pattern,
+            pitch=cfg.infill.target_cell_pitch,
+        )
+    else:
+        _progress(5, "Stage 1: Building lightweight 3D surface field...")
+        _log(f"[Stage 1] Building lightweight surface field (pitch={cfg.voxel_pitch_mm} mm)...")
+        field = VolumetricField(mesh, pitch=cfg.voxel_pitch_mm)
+
+        _progress(22, "Stage 2-3: Synthesizing 3D surface-normal cellular infill...")
+        _log(
+            f"[Stage 2-3] Synthesizing 3D outer-surface {cfg.infill.pattern} pattern "
+            f"(mode={cfg.infill.mode}, pitch={cfg.infill.target_cell_pitch} mm, "
+            f"resin_channel={cfg.infill.min_channel_clearance} mm, "
+            f"flatten_angle=<{cfg.infill.flatten_angle_deg} deg)..."
+        )
+        lattice = generate_normal_dendritic_infill(field, cfg)
+        _log(f"            Placed {len(lattice.seeds)} cells ({len(lattice)} 3D wireframe edges).")
 
     _progress(42, "Stage 3: Exact analytical vector XY slicing...")
     _log(
@@ -106,7 +124,7 @@ def slice_mesh(
 
     for idx, ly in enumerate(layers):
         fff_paths = generate_fff_paths_for_layer(ly, xs, ys, cfg)
-        hal.emit_fff_layer(ly.layer_idx, ly.z, fff_paths)
+        hal.emit_fff_layer(ly.layer_idx, ly.z, fff_paths, layer_height=ly.layer_height)
 
         if (not cfg.hybrid.is_fff_only) and (ly.layer_idx in cycle_by_layer):
             cycle = cycle_by_layer[ly.layer_idx]

@@ -25,27 +25,45 @@ class CureCycle:
     trigger: str
 
 
-def _slab_3d_needle_accessible(layers: List[SlicedLayer], start_idx0: int, end_idx0: int) -> bool:
-    """Verify every 3D connected resin basin in [start_idx0..end_idx0] has needle access on the top slice."""
+_CONN_2D_8 = np.ones((3, 3), dtype=np.int32)
+_CONN_3D_26 = np.ones((3, 3, 3), dtype=np.int32)
+
+
+def _slab_3d_needle_accessible(
+    layers: List[SlicedLayer],
+    start_idx0: int,
+    end_idx0: int,
+    ghost_min_px: int = 2,
+) -> bool:
+    """
+    Verify every non-ghost 3D connected resin basin in [start_idx0..end_idx0]
+    has needle access on the top slice.
+    """
     top_void = layers[end_idx0].void_mask
     top_acc = layers[end_idx0].accessible_mask
     if not np.any(top_void):
         return True
 
-    lbl_2d, n_2d = ndimage.label(top_void)
+    lbl_2d, n_2d = ndimage.label(top_void, structure=_CONN_2D_8)
     all_2d_ok = True
     for i in range(1, n_2d + 1):
-        if not np.any(top_acc[lbl_2d == i]):
+        m = lbl_2d == i
+        if int(np.count_nonzero(m)) <= ghost_min_px:
+            continue
+        if not np.any(top_acc[m]):
             all_2d_ok = False
             break
     if all_2d_ok:
         return True
 
     slab = np.stack([layers[i].void_mask for i in range(start_idx0, end_idx0 + 1)], axis=0)
-    lbl_3d, n_3d = ndimage.label(slab)
+    lbl_3d, n_3d = ndimage.label(slab, structure=_CONN_3D_26)
     top_slice_lbl = lbl_3d[-1]
     for cid in range(1, n_3d + 1):
-        if not np.any(top_acc[top_slice_lbl == cid]):
+        top_c = top_slice_lbl == cid
+        if int(np.count_nonzero(top_c)) <= ghost_min_px:
+            continue
+        if not np.any(top_acc[top_c]):
             return False
     return True
 
@@ -53,18 +71,31 @@ def _slab_3d_needle_accessible(layers: List[SlicedLayer], start_idx0: int, end_i
 def compute_optimal_cure_schedule(
     layers: List[SlicedLayer], cfg: SlicerConfig
 ) -> List[CureCycle]:
-    """Solve the globally optimal cure schedule across all layers via Dynamic Programming."""
+    """
+    Solve the globally optimal cure schedule across all layers via Dynamic Programming.
+    Minimizes ``hard_roof_closure`` occurrences by globally rebalancing earlier injection
+    cadences and ignoring sub-needle 1-2 px raster staircase ghost slivers.
+    """
     rcfg = cfg.resin
     h = cfg.fff.layer_height
     rp = cfg.slice_raster_pitch_mm
-    px_vol_mm3 = rp * rp * h
+    px_area = rp * rp
+    px_vol_mm3 = px_area * h
     num_layers = len(layers)
 
     x_max_beer = int(math.floor((rcfg.max_cure_depth_mm * rcfg.cure_depth_safety_eta) / h))
     x_max_eff = max(1, min(rcfg.x_max_layers, x_max_beer))
+    x_min_eff = max(1, min(rcfg.x_min_layers, x_max_eff))
+
+    ghost_min_area = max(0.0, float(getattr(rcfg, "ghost_island_min_area_mm2", 0.85)))
+    ghost_min_px = max(2, int(math.ceil(ghost_min_area / max(px_area, 1e-6)))) if ghost_min_area > 0.0 else 0
 
     bleed_px = int(round(rcfg.uv_shadow_bleed_mm / rp))
     bleed_disk = disk_kernel(bleed_px) if bleed_px > 0 else None
+
+    # Lexicographic-tier penalty so the global DP ALWAYS prefers adjusting earlier pump layers
+    # (e.g., 5+4+4 instead of 6+6+1) over emitting an avoidable hard_roof_closure cycle.
+    hard_roof_base_penalty = 5000.0
 
     inf = float("inf")
     dp_cost = [inf] * (num_layers + 1)
@@ -74,10 +105,14 @@ def compute_optimal_cure_schedule(
     dp_cost[0] = 0.0
 
     void_counts = [int(np.count_nonzero(ly.void_mask)) for ly in layers]
+    last_void_layer = 0
+    for idx_v, vc in enumerate(void_counts):
+        if vc > ghost_min_px:
+            last_void_layer = idx_v + 1
 
     for k in range(1, num_layers + 1):
         ly_k = layers[k - 1]
-        if void_counts[k - 1] == 0:
+        if void_counts[k - 1] <= ghost_min_px:
             dp_cost[k] = dp_cost[k - 1]
             dp_prev[k] = k - 1
             dp_trigger[k] = "none"
@@ -92,16 +127,26 @@ def compute_optimal_cure_schedule(
         for p in range(k - 1, p_min - 1, -1):
             if p < k - 1:
                 j_idx0 = p
-                if void_counts[j_idx0] == 0:
+                if void_counts[j_idx0] <= ghost_min_px:
                     break
 
                 solid_above |= layers[j_idx0 + 1].solid_mask
 
-                # Airlock-free monotonic buoyancy check
+                # Airlock-free monotonic buoyancy check (8-connected, immune to single-pixel raster ghosts)
                 vent_seeds = layers[j_idx0].void_mask & air_vent_reach
-                air_vent_reach = ndimage.binary_propagation(vent_seeds, mask=layers[j_idx0].void_mask)
-                if int(np.count_nonzero(air_vent_reach)) < void_counts[j_idx0]:
-                    break
+                air_vent_reach = ndimage.binary_propagation(
+                    vent_seeds, structure=_CONN_2D_8, mask=layers[j_idx0].void_mask
+                )
+                trapped_mask = layers[j_idx0].void_mask & (~air_vent_reach)
+                trapped_px = int(np.count_nonzero(trapped_mask))
+                if trapped_px > 0:
+                    if trapped_px > max(ghost_min_px, int(0.02 * void_counts[j_idx0])):
+                        break
+                    t_lbl, n_t = ndimage.label(trapped_mask, structure=_CONN_2D_8)
+                    if n_t > 0:
+                        t_sizes = np.bincount(t_lbl.ravel())[1:]
+                        if int(t_sizes.max()) > ghost_min_px:
+                            break
 
                 dark_core = (
                     ndimage.binary_erosion(solid_above, structure=bleed_disk)
@@ -114,7 +159,7 @@ def compute_optimal_cure_schedule(
             if dp_cost[p] == inf:
                 continue
 
-            if p < k - 1 and not _slab_3d_needle_accessible(layers, p, k - 1):
+            if p < k - 1 and not _slab_3d_needle_accessible(layers, p, k - 1, ghost_min_px=ghost_min_px):
                 break
 
             shadow_ratio = cum_shadow_px / max(1, cum_void_px)
@@ -122,20 +167,31 @@ def compute_optimal_cure_schedule(
                 break
 
             span = k - p
-            shortfall = max(0, rcfg.x_min_layers - span)
+            shortfall = max(0, x_min_eff - span)
             shadow_mm3 = cum_shadow_px * px_vol_mm3
+            is_final = (k == num_layers) or (k == last_void_layer)
+            is_hard_roof = (shortfall > 0) and (not is_final)
+
+            # Dominant penalty for avoidable hard_roof_closure so DP shifts earlier pump cadence
+            short_pen = rcfg.dp_w_short * (shortfall * shortfall)
+            if is_hard_roof:
+                short_pen += hard_roof_base_penalty
+
+            # Gentle tie-breaker prefers balanced spans near x_max_eff when roof count is tied
+            cadence_bias = 0.08 * float(x_max_eff - span)
             step_cost = (
                 rcfg.dp_w_cycle
-                + rcfg.dp_w_short * (shortfall * shortfall)
+                + short_pen
                 + rcfg.dp_w_shadow * shadow_mm3
+                + cadence_bias
             )
             total_cost = dp_cost[p] + step_cost
 
             if total_cost < dp_cost[k]:
                 trig = "optimal_cadence"
-                if k == num_layers:
+                if is_final:
                     trig = "final_top_layer"
-                elif span < rcfg.x_min_layers:
+                elif is_hard_roof:
                     trig = "hard_roof_closure"
                 dp_cost[k] = total_cost
                 dp_prev[k] = p

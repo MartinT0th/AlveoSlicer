@@ -31,7 +31,12 @@ class _DualVerticalTrack(QWidget):
         self._high = 1
         self._cure_layers: List[int] = []
         self._dragging: Optional[str] = None
+        self._is_light = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_light_mode(self, is_light: bool) -> None:
+        self._is_light = is_light
+        self.update()
 
     def configure(self, num_layers: int, cure_layers: Sequence[int]) -> None:
         self._min_val = 1
@@ -86,34 +91,40 @@ class _DualVerticalTrack(QWidget):
         track_w = 6.0
         track_rect = QRectF(cx - track_w * 0.5, pad, track_w, max(1.0, self.height() - 2.0 * pad))
 
+        groove_col = QColor("#cfd6e2") if self._is_light else QColor("#2c303c")
+        accent_col = QColor("#eab308") if self._is_light else QColor("#f5c518")
+        cure_col = QColor("#0284c7") if self._is_light else QColor("#00d4ff")
+        rim_col = QColor("#475569") if self._is_light else QColor("#141518")
+        lo_col = QColor("#64748b") if self._is_light else QColor("#9aa2b1")
+
         # Background groove
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor("#2c303c"))
+        p.setBrush(groove_col)
         p.drawRoundedRect(track_rect, 3.0, 3.0)
 
         # Active yellow range
         y_hi = self._val_to_y(self._high)
         y_lo = self._val_to_y(self._low)
         active_rect = QRectF(cx - track_w * 0.5, y_hi, track_w, max(2.0, y_lo - y_hi))
-        p.setBrush(QColor("#f5c518"))
+        p.setBrush(accent_col)
         p.drawRoundedRect(active_rect, 3.0, 3.0)
 
         # Cyan ticks for every UV cure cycle layer
-        pen_tick = QPen(QColor("#00d4ff"), 1.6)
+        pen_tick = QPen(cure_col, 1.6)
         p.setPen(pen_tick)
         for cl in self._cure_layers:
             yc = self._val_to_y(cl)
             p.drawLine(int(cx - 11), int(yc), int(cx - 5), int(yc))
             p.drawLine(int(cx + 5), int(yc), int(cx + 11), int(yc))
 
-        # Lower handle (subtle dark-rimmed pill)
-        p.setPen(QPen(QColor("#141518"), 1.4))
-        p.setBrush(QColor("#9aa2b1"))
+        # Lower handle
+        p.setPen(QPen(rim_col, 1.4))
+        p.setBrush(lo_col)
         p.drawRoundedRect(QRectF(cx - 9.0, y_lo - 5.0, 18.0, 10.0), 4.0, 4.0)
 
         # Upper handle (bright AlveoSlicer yellow)
-        p.setPen(QPen(QColor("#141518"), 1.5))
-        p.setBrush(QColor("#f5c518"))
+        p.setPen(QPen(rim_col, 1.5))
+        p.setBrush(accent_col)
         p.drawRoundedRect(QRectF(cx - 11.0, y_hi - 6.0, 22.0, 12.0), 4.0, 4.0)
         p.end()
 
@@ -167,23 +178,23 @@ class LayerRangeBar(QFrame):
         vbox.setSpacing(5)
 
         self.lbl_top = QLabel("L 0 / 0")
+        self.lbl_top.setObjectName("accentValue")
         self.lbl_top.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_top.setStyleSheet("color: #f5c518; font-weight: 700; font-size: 11px;")
         vbox.addWidget(self.lbl_top)
 
         self.lbl_z = QLabel("Z 0.00 mm")
+        self.lbl_z.setObjectName("mutedLabel")
         self.lbl_z.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_z.setStyleSheet("color: #9aa2b1; font-size: 10px;")
         vbox.addWidget(self.lbl_z)
 
-        self.lbl_cure = QLabel("")
+        self.lbl_cure = QLabel("UV CURE")
+        self.lbl_cure.setObjectName("modeBannerFFF")
         self.lbl_cure.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_cure.setFixedHeight(26)
+        cure_sp = self.lbl_cure.sizePolicy()
+        cure_sp.setRetainSizeWhenHidden(True)
+        self.lbl_cure.setSizePolicy(cure_sp)
         self.lbl_cure.setVisible(False)
-        self.lbl_cure.setStyleSheet(
-            "background-color: rgba(0, 212, 255, 0.16); color: #00d4ff; "
-            "border: 1px solid rgba(0, 212, 255, 0.5); border-radius: 4px; "
-            "font-size: 10px; font-weight: 700; padding: 2px;"
-        )
         vbox.addWidget(self.lbl_cure)
 
         step_row = QHBoxLayout()
@@ -203,8 +214,8 @@ class LayerRangeBar(QFrame):
         vbox.addWidget(self.track, stretch=1)
 
         self.lbl_bot = QLabel("Min: 1")
+        self.lbl_bot.setObjectName("mutedLabel")
         self.lbl_bot.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_bot.setStyleSheet("color: #9aa2b1; font-size: 10px;")
         vbox.addWidget(self.lbl_bot)
 
         self.btn_next_cure = QPushButton("Next Cure")
@@ -212,6 +223,9 @@ class LayerRangeBar(QFrame):
         self.btn_next_cure.setEnabled(False)
         self.btn_next_cure.clicked.connect(self.jump_next_cure)
         vbox.addWidget(self.btn_next_cure)
+
+    def apply_theme(self, resolved_mode: str) -> None:
+        self.track.set_light_mode(resolved_mode == "light")
 
     def configure(self, layer_zs: Sequence[float], cure_layers: Sequence[int]) -> None:
         self._layer_zs = list(layer_zs)

@@ -14,7 +14,13 @@ FEATURE_TYPES: Tuple[str, ...] = (
     "Perimeter",
     "Internal infill",
     "Solid infill",
+    "Top solid infill",
+    "Ironing",
+    "Skirt/Brim",
     "Support material",
+    "Support material interface",
+    "Wipe tower",
+    "Filled resin",
     "Custom",
 )
 
@@ -22,12 +28,18 @@ FEATURE_TYPE_TO_ID: Dict[str, int] = {name: idx for idx, name in enumerate(FEATU
 
 # Slick AlveoSlicer yellow-accented PrusaSlicer-inspired palette
 FEATURE_COLORS: Dict[str, Tuple[float, float, float]] = {
-    "External perimeter": (0.96, 0.77, 0.09),  # Vivid AlveoSlicer yellow
-    "Perimeter": (0.92, 0.58, 0.16),           # Warm gold-amber
-    "Internal infill": (0.93, 0.33, 0.31),     # Coral red (inside perimeters)
-    "Solid infill": (0.69, 0.36, 0.85),        # Violet (top/bottom skins & flat cell caps)
-    "Support material": (0.26, 0.72, 0.40),    # Emerald green (dry hollow-core support)
-    "Custom": (0.58, 0.64, 0.72),              # Neutral steel
+    "External perimeter": (0.96, 0.77, 0.09),          # Vivid AlveoSlicer yellow
+    "Perimeter": (0.92, 0.58, 0.16),                   # Warm gold-amber
+    "Internal infill": (0.93, 0.33, 0.31),             # Coral red (inside perimeters)
+    "Solid infill": (0.69, 0.36, 0.85),                # Violet (solid skins & flat cell caps)
+    "Top solid infill": (0.88, 0.44, 0.72),            # Magenta-rose (top finish skin)
+    "Ironing": (0.74, 0.88, 0.98),                     # Crisp ice-silver (top ironing pass)
+    "Skirt/Brim": (0.18, 0.72, 0.68),                  # Teal (skirt & brim)
+    "Support material": (0.26, 0.72, 0.40),            # Emerald green (supports)
+    "Support material interface": (0.48, 0.88, 0.42),  # Bright lime (support interface)
+    "Wipe tower": (0.42, 0.56, 0.92),                  # Cobalt blue (purge / wipe tower)
+    "Filled resin": (0.04, 0.76, 0.95),                # Glossy translucent cyan photopolymer
+    "Custom": (0.58, 0.64, 0.72),                      # Neutral steel
 }
 
 TRAVEL_COLOR: Tuple[float, float, float] = (0.22, 0.72, 0.96)
