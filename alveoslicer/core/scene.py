@@ -209,6 +209,17 @@ class BuildPlate:
         self.preview_data = None
         self.gcode_text = ""
 
+    def instance_meshes(self) -> List[trimesh.Trimesh]:
+        """Return independent world-space copies of every instance mesh on this plate, preserving paint."""
+        out: List[trimesh.Trimesh] = []
+        for inst in self.instances:
+            m = inst.transformed_mesh().copy()
+            ps = inst.paint_support
+            if ps is not None and len(ps) == len(m.faces):
+                m.metadata["paint_support"] = ps.copy()
+            out.append(m)
+        return out
+
     def combined_mesh(self) -> Optional[trimesh.Trimesh]:
         """Concatenate all instances on this plate into one mesh, preserving per-face support paint."""
         if not self.instances:

@@ -10,7 +10,8 @@ alongside external supports, dry-core supports, skirt/brim, and wipe tower synth
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import shapely
@@ -32,8 +33,9 @@ from ..core.geometry import (
     safe_difference,
     safe_intersection,
     safe_union,
+    split_mesh_bodies,
 )
-from ..infill.lattice import NormalVoronoiLattice, clip_voronoi_cell_2d
+from ..infill.lattice import Capsule, NormalVoronoiLattice, clip_voronoi_cell_2d
 from ..infill.standard import generate_standard_infill_layer as _generate_standard_infill_layer
 from .adhesion import _generate_skirt_and_brim, _generate_wipe_tower
 from .layer import SlicedLayer, _erode_3d_spherical_vector, _slice_mesh_plane_exact
@@ -242,55 +244,36 @@ def _slice_gyroid_layer(
     return cell_outer, Polygon(), Polygon(), inside_perims
 
 
-def slice_model_to_layers(
-    mesh: trimesh.Trimesh,
-    field: VolumetricField,
-    capsules: List[Capsule],
-    cfg: SlicerConfig,
-) -> Tuple[List[SlicedLayer], np.ndarray, np.ndarray]:
-    """
-    Exact vector planar XY slicing (Stages 2 & 3):
-      - Variable first-layer height, XY size compensation, & Layer 1 elephant foot compensation
-      - Outer & inner walls: exact triangle-plane intersections & spherical vector offsets
-      - Choice of 3D Surface-Normal Cellular Infill OR Standard PrusaSlicer Infill (17 patterns)
-      - External overhang supports + interfaces, Skirt & Brim, and Purge/Wipe Tower
-    """
-    del field  # Retained in public signature for engine/UI contract compatibility
+@dataclass
+class _BodySliceData:
+    """Intermediate per-layer exact vector geometries generated independently for one solid body."""
 
+    outer_geom: List[shapely.Geometry]
+    shell_geom: List[shapely.Geometry]
+    cell_wall_geom: List[shapely.Geometry]
+    inside_perims: List[List[np.ndarray]]
+    cell_cap_geom: List[shapely.Geometry]
+    empty_cell_geom: List[shapely.Geometry]
+    resin_void_geom: List[shapely.Geometry]
+    dry_support_lines: List[List[np.ndarray]]
+    dry_support_polys: List[shapely.Geometry]
+    ext_support_lines: List[List[np.ndarray]]
+    ext_support_interface_lines: List[List[np.ndarray]]
+    top_surface_geom: List[shapely.Geometry]
+
+
+def _slice_single_body_layers(
+    body_mesh: trimesh.Trimesh,
+    body_lattice: Optional[Sequence[Capsule]],
+    layer_heights: List[float],
+    z_mids: List[float],
+    cfg: SlicerConfig,
+) -> _BodySliceData:
+    """Slice a single connected body independently across the shared plate layer stack ``z_mids``."""
     f = cfg.fff
     h = max(0.05, float(f.layer_height))
-    h_first = max(0.05, float(f.first_layer_height))
     lw = max(0.15, float(f.line_width))
     lw_infill = max(0.15, float(f.infill_line_width or lw))
-    z_max = float(mesh.bounds[1, 2])
-    use_standard_infill = str(cfg.infill.infill_engine).lower() == "standard"
-
-    # Build exact variable-height layer stack (Layer 1 = h_first, Layers 2..N = h)
-    layer_heights: List[float] = []
-    z_mids: List[float] = []
-    z_tops: List[float] = []
-    z_cur = 0.0
-    while z_cur < z_max - 1e-4 or not layer_heights:
-        hk = h_first if not layer_heights else h
-        if z_cur + 0.5 * hk > z_max + 1e-4 and layer_heights:
-            break
-        layer_heights.append(hk)
-        z_mids.append(z_cur + 0.5 * hk)
-        z_cur += hk
-        z_tops.append(z_cur)
-    num_layers = len(layer_heights)
-
-    rp = cfg.slice_raster_pitch_mm
-    pad_xy = 2.0
-    x_min = float(mesh.bounds[0, 0]) - pad_xy
-    x_max = float(mesh.bounds[1, 0]) + pad_xy
-    y_min = float(mesh.bounds[0, 1]) - pad_xy
-    y_max = float(mesh.bounds[1, 1]) + pad_xy
-
-    xs = np.arange(x_min, x_max + rp, rp)
-    ys = np.arange(y_min, y_max + rp, rp)
-    gx, gy = np.meshgrid(xs, ys, indexing="ij")
-
     lw_perim = max(0.15, float(f.perimeter_line_width or lw))
     eff_perims = 1 if f.spiral_vase else max(1, f.perimeters)
     outer_shell = eff_perims * lw_perim
@@ -300,21 +283,23 @@ def slice_model_to_layers(
     t_cell_wall = max(lw, 2.0 * cfg.infill.strut_radius)
     n_inside_perims = max(1, int(round(t_cell_wall / lw)))
     fillet_r = max(0.0, cfg.infill.smin_blend_radius)
+    use_standard_infill = str(cfg.infill.infill_engine).lower() == "standard"
+    num_layers = len(layer_heights)
 
-    needle_erode_px = max(
-        1,
-        int(math.ceil((cfg.resin.needle_outer_radius_mm + cfg.resin.needle_safety_clear_mm) / rp)),
-    )
-    needle_disk = disk_kernel(needle_erode_px)
-
-    # 1. Exact vector mesh slicing for all layers + XY Size, XY Hole & Elephant Foot compensations
-    tri_verts = np.asarray(mesh.triangles, dtype=np.float64)
+    # 1. Exact vector mesh slicing for this body + XY Size, XY Hole & Elephant Foot compensations
+    tri_verts = np.asarray(body_mesh.triangles, dtype=np.float64)
     tri_zmin = tri_verts[:, :, 2].min(axis=1)
     tri_zmax = tri_verts[:, :, 2].max(axis=1)
+    body_zmin = float(body_mesh.bounds[0, 2])
+    body_zmax = float(body_mesh.bounds[1, 2])
 
     outer_polys: List[shapely.Geometry] = []
     for k in range(num_layers):
-        p = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, z_mids[k]))
+        zm = z_mids[k]
+        if zm < body_zmin - 1e-4 or zm > body_zmax + 1e-4:
+            outer_polys.append(Polygon())
+            continue
+        p = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, zm))
         if not p.is_empty and abs(f.xy_size_compensation_mm) > 1e-4:
             p_comp_xy = safe_buffer(p, f.xy_size_compensation_mm, join_style=2)
             if not p_comp_xy.is_empty:
@@ -341,6 +326,8 @@ def slice_model_to_layers(
                 p = p_ef
         outer_polys.append(clean_geom(p))
 
+    body_top_layer = max((k for k, p in enumerate(outer_polys) if not p.is_empty), default=-1)
+
     # 2. Exact 3D vector shell, composite wall, inner skin, and dry hollow core per layer
     comp_geoms: List[shapely.Geometry] = []
     shell_geoms: List[shapely.Geometry] = []
@@ -366,8 +353,7 @@ def slice_model_to_layers(
             top_surface_geoms.append(Polygon())
             continue
 
-        # Exposed top horizontal surface (used for PrusaSlicer Ironing & Lightning/Only-where-needed)
-        if k == num_layers - 1:
+        if k >= body_top_layer or k == num_layers - 1:
             top_surf = p_mod
         else:
             top_surf = safe_difference(p_mod, outer_polys[k + 1])
@@ -381,7 +367,7 @@ def slice_model_to_layers(
             p_shell = safe_difference(p_mod, p_in_outer) if not p_in_outer.is_empty else p_mod
         else:
             p_in_outer = _erode_3d_spherical_vector(outer_polys, k, outer_shell, h)
-            if k < b_bot or (b_top > 0 and (k + b_top) >= num_layers):
+            if k < b_bot or (b_top > 0 and (k + b_top) > body_top_layer):
                 p_in_outer = Polygon()
             else:
                 if b_bot > 0:
@@ -424,12 +410,10 @@ def slice_model_to_layers(
             if not top_surface_geoms[k].is_empty:
                 acc_roof = safe_union([acc_roof, top_surface_geoms[k]]) if not acc_roof.is_empty else top_surface_geoms[k]
             if not acc_roof.is_empty and not comp_geoms[k].is_empty:
-                # Taper lightning/support cone slightly downward
                 acc_roof = clean_geom(safe_intersection(acc_roof, outer_polys[k]))
                 roof_proj_masks[k] = acc_roof
 
-    # 3. Exact vector dry-core supports, external overhang supports (with paint-on enforcers/blockers),
-    #    skirt/brim/draft shield, & wipe tower
+    # 3. Per-body dry-core supports and external overhang supports (respecting this body's paint_support)
     if (not use_standard_infill) and cfg.infill.mode == "hollow_shell" and not f.spiral_vase:
         dry_support_lines_all, dry_support_polys_all = _generate_dry_core_supports(
             dry_core_geoms, inner_skin_geoms, lw, f.dry_support_spacing_mm
@@ -439,30 +423,27 @@ def slice_model_to_layers(
         dry_support_polys_all = [Polygon() for _ in range(num_layers)]
 
     ext_sup_lines_all, ext_iface_lines_all = _generate_external_supports(
-        outer_polys, layer_heights, cfg, mesh=mesh, z_mids=z_mids
+        outer_polys, layer_heights, cfg, mesh=body_mesh, z_mids=z_mids
     )
-    skirt_brim_all = _generate_skirt_and_brim(
-        outer_polys[0] if num_layers > 0 else Polygon(),
-        ext_sup_lines_all[0] if num_layers > 0 else [],
-        num_layers,
-        cfg,
-    )
-    wipe_tower_all = _generate_wipe_tower(num_layers, layer_heights, cfg)
 
-    # 4. Exact analytical infill slicing (Standard PrusaSlicer Infill OR 3D Surface-Normal Cellular)
+    # 4. Per-body exact analytical infill slicing (Standard OR this body's own 3D Cellular Lattice)
     has_lattice = (
         not use_standard_infill
         and not f.spiral_vase
-        and isinstance(capsules, NormalVoronoiLattice)
-        and (len(capsules.seeds) > 0 or capsules.pattern == "gyroid")
+        and isinstance(body_lattice, NormalVoronoiLattice)
+        and (len(body_lattice.seeds) > 0 or body_lattice.pattern == "gyroid")
     )
-    layers: List[SlicedLayer] = []
+
+    cell_wall_geoms: List[shapely.Geometry] = []
+    inside_perims_all: List[List[np.ndarray]] = []
+    cell_cap_geoms: List[shapely.Geometry] = []
+    empty_cell_geoms: List[shapely.Geometry] = []
+    resin_void_geoms: List[shapely.Geometry] = []
 
     for k in range(num_layers):
         z_mid = z_mids[k]
         p_mod = outer_polys[k]
         p_comp = comp_geoms[k]
-        p_shell = shell_geoms[k]
         p_dry = dry_core_geoms[k]
 
         if use_standard_infill and not f.spiral_vase and not p_comp.is_empty and p_comp.area > 0.1:
@@ -487,9 +468,9 @@ def slice_model_to_layers(
             cell_wall_geom = safe_union(wall_geoms_preview) if wall_geoms_preview else Polygon()
             all_cells_outer = cell_wall_geom
         elif has_lattice and not p_comp.is_empty and p_comp.area > 0.1:
-            assert isinstance(capsules, NormalVoronoiLattice)
+            assert isinstance(body_lattice, NormalVoronoiLattice)
             all_cells_outer, empty_cells_geom, cell_cap_geom, inside_perims_k = _slice_layer_cells(
-                lattice=capsules,
+                lattice=body_lattice,
                 z_mid=z_mid,
                 p_mod=p_mod,
                 p_comp=p_comp,
@@ -521,11 +502,158 @@ def slice_model_to_layers(
             safe_difference(p_comp, all_cells_outer) if not p_comp.is_empty else Polygon()
         )
 
+        cell_wall_geoms.append(cell_wall_geom)
+        inside_perims_all.append(inside_perims_k)
+        cell_cap_geoms.append(cell_cap_geom)
+        empty_cell_geoms.append(empty_cells_geom)
+        resin_void_geoms.append(resin_void_geom)
+
+    return _BodySliceData(
+        outer_geom=outer_polys,
+        shell_geom=shell_geoms,
+        cell_wall_geom=cell_wall_geoms,
+        inside_perims=inside_perims_all,
+        cell_cap_geom=cell_cap_geoms,
+        empty_cell_geom=empty_cell_geoms,
+        resin_void_geom=resin_void_geoms,
+        dry_support_lines=dry_support_lines_all,
+        dry_support_polys=dry_support_polys_all,
+        ext_support_lines=ext_sup_lines_all,
+        ext_support_interface_lines=ext_iface_lines_all,
+        top_surface_geom=top_surface_geoms,
+    )
+
+
+def slice_model_to_layers(
+    mesh: trimesh.Trimesh,
+    field: VolumetricField,
+    capsules: List[Capsule],
+    cfg: SlicerConfig,
+    bodies: Optional[List[trimesh.Trimesh]] = None,
+    body_lattices: Optional[List[NormalVoronoiLattice]] = None,
+) -> Tuple[List[SlicedLayer], np.ndarray, np.ndarray]:
+    """
+    Exact vector planar XY slicing (Stages 2 & 3) with independent per-body slicing:
+      - Each disconnected solid body is sliced separately against its own 3D cellular lattice
+        (preventing cross-body Voronoi leakage and guaranteeing every body gets its own cells)
+      - Variable first-layer height, XY size compensation, & Layer 1 elephant foot compensation
+      - Choice of 3D Surface-Normal Cellular Infill OR Standard PrusaSlicer Infill (17 patterns)
+      - External overhang supports + interfaces, Skirt & Brim, and Purge/Wipe Tower
+    """
+    del field  # Retained in public signature for engine/UI contract compatibility
+
+    f = cfg.fff
+    h = max(0.05, float(f.layer_height))
+    h_first = max(0.05, float(f.first_layer_height))
+
+    if bodies is not None and len(bodies) > 0:
+        resolved_bodies = list(bodies)
+    else:
+        resolved_bodies = split_mesh_bodies(mesh) or [mesh]
+
+    if body_lattices is not None and len(body_lattices) == len(resolved_bodies):
+        resolved_lattices: List[Optional[Sequence[Capsule]]] = list(body_lattices)
+    else:
+        resolved_lattices = [capsules for _ in resolved_bodies]
+
+    z_max = max(float(b.bounds[1, 2]) for b in resolved_bodies)
+
+    # Build exact shared variable-height layer stack (Layer 1 = h_first, Layers 2..N = h)
+    layer_heights: List[float] = []
+    z_mids: List[float] = []
+    z_tops: List[float] = []
+    z_cur = 0.0
+    while z_cur < z_max - 1e-4 or not layer_heights:
+        hk = h_first if not layer_heights else h
+        if z_cur + 0.5 * hk > z_max + 1e-4 and layer_heights:
+            break
+        layer_heights.append(hk)
+        z_mids.append(z_cur + 0.5 * hk)
+        z_cur += hk
+        z_tops.append(z_cur)
+    num_layers = len(layer_heights)
+
+    rp = cfg.slice_raster_pitch_mm
+    pad_xy = 2.0
+    x_min = min(float(b.bounds[0, 0]) for b in resolved_bodies) - pad_xy
+    x_max = max(float(b.bounds[1, 0]) for b in resolved_bodies) + pad_xy
+    y_min = min(float(b.bounds[0, 1]) for b in resolved_bodies) - pad_xy
+    y_max = max(float(b.bounds[1, 1]) for b in resolved_bodies) + pad_xy
+
+    xs = np.arange(x_min, x_max + rp, rp)
+    ys = np.arange(y_min, y_max + rp, rp)
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+
+    needle_erode_px = max(
+        1,
+        int(math.ceil((cfg.resin.needle_outer_radius_mm + cfg.resin.needle_safety_clear_mm) / rp)),
+    )
+    needle_disk = disk_kernel(needle_erode_px)
+
+    # Slice each solid body completely independently
+    body_slices = [
+        _slice_single_body_layers(b_mesh, b_lat, layer_heights, z_mids, cfg)
+        for b_mesh, b_lat in zip(resolved_bodies, resolved_lattices)
+    ]
+
+    # Merge per-body layer geometries onto the shared plate stack
+    if len(body_slices) == 1:
+        b0 = body_slices[0]
+        outer_merged = b0.outer_geom
+        shell_merged = b0.shell_geom
+        cell_wall_merged = b0.cell_wall_geom
+        inside_perims_merged = b0.inside_perims
+        cell_cap_merged = b0.cell_cap_geom
+        empty_cell_merged = b0.empty_cell_geom
+        resin_void_merged = b0.resin_void_geom
+        dry_lines_merged = b0.dry_support_lines
+        dry_polys_merged = b0.dry_support_polys
+        ext_sup_merged = b0.ext_support_lines
+        ext_iface_merged = b0.ext_support_interface_lines
+        top_surf_merged = b0.top_surface_geom
+    else:
+        outer_merged = [safe_union([bs.outer_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        shell_merged = [safe_union([bs.shell_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        cell_wall_merged = [safe_union([bs.cell_wall_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        inside_perims_merged = [
+            [ln for bs in body_slices for ln in bs.inside_perims[k]] for k in range(num_layers)
+        ]
+        cell_cap_merged = [safe_union([bs.cell_cap_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        empty_cell_merged = [safe_union([bs.empty_cell_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        resin_void_merged = [safe_union([bs.resin_void_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        dry_lines_merged = [
+            [ln for bs in body_slices for ln in bs.dry_support_lines[k]] for k in range(num_layers)
+        ]
+        dry_polys_merged = [safe_union([bs.dry_support_polys[k] for bs in body_slices]) for k in range(num_layers)]
+        ext_sup_merged = [
+            [ln for bs in body_slices for ln in bs.ext_support_lines[k]] for k in range(num_layers)
+        ]
+        ext_iface_merged = [
+            [ln for bs in body_slices for ln in bs.ext_support_interface_lines[k]] for k in range(num_layers)
+        ]
+        top_surf_merged = [safe_union([bs.top_surface_geom[k] for bs in body_slices]) for k in range(num_layers)]
+
+    # Plate-level Skirt/Brim (wraps all objects cleanly) & Wipe Tower
+    skirt_brim_all = _generate_skirt_and_brim(
+        outer_merged[0] if num_layers > 0 else Polygon(),
+        ext_sup_merged[0] if num_layers > 0 else [],
+        num_layers,
+        cfg,
+    )
+    wipe_tower_all = _generate_wipe_tower(num_layers, layer_heights, cfg)
+
+    layers: List[SlicedLayer] = []
+    for k in range(num_layers):
+        p_mod = outer_merged[k]
+        p_shell = shell_merged[k]
+        cell_wall_geom = cell_wall_merged[k]
+        resin_void_geom = resin_void_merged[k]
+
         # Internal 2D masks for Stage 4 (DP), Stage 5 (BFS), and 2D UI preview
         shell_m = rasterize_geom(p_shell, gx, gy)
         infill_m = rasterize_geom(cell_wall_geom, gx, gy) & (~shell_m)
         solid_m = shell_m | infill_m
-        dry_m = rasterize_geom(dry_support_polys_all[k], gx, gy) & (~solid_m)
+        dry_m = rasterize_geom(dry_polys_merged[k], gx, gy) & (~solid_m)
         void_m = rasterize_geom(resin_void_geom, gx, gy) & (~solid_m)
         acc_m = (
             ndimage.binary_erosion(void_m, structure=needle_disk)
@@ -547,17 +675,17 @@ def slice_model_to_layers(
                 outer_geom=p_mod,
                 shell_geom=p_shell,
                 cell_wall_geom=cell_wall_geom,
-                inside_perimeter_lines=inside_perims_k,
-                cell_cap_geom=cell_cap_geom,
-                empty_cell_geom=empty_cells_geom,
+                inside_perimeter_lines=inside_perims_merged[k],
+                cell_cap_geom=cell_cap_merged[k],
+                empty_cell_geom=empty_cell_merged[k],
                 resin_void_geom=resin_void_geom,
-                dry_support_lines=dry_support_lines_all[k],
+                dry_support_lines=dry_lines_merged[k],
                 skirt_brim_lines=skirt_brim_all[k],
-                ext_support_lines=ext_sup_lines_all[k],
-                ext_support_interface_lines=ext_iface_lines_all[k],
+                ext_support_lines=ext_sup_merged[k],
+                ext_support_interface_lines=ext_iface_merged[k],
                 wipe_tower_lines=wipe_tower_all[k],
                 is_top_solid_layer=(k == num_layers - 1),
-                top_surface_geom=top_surface_geoms[k],
+                top_surface_geom=top_surf_merged[k],
             )
         )
 

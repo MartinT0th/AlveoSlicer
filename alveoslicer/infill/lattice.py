@@ -66,6 +66,49 @@ class NormalVoronoiLattice(list):
         self.pitch = pitch
 
 
+def combine_lattices(
+    lattices: List[NormalVoronoiLattice],
+    pattern: str = "hexagonal",
+    pitch: float = 10.0,
+) -> NormalVoronoiLattice:
+    """Merge multiple independent per-body ``NormalVoronoiLattice`` instances into one combined preview lattice."""
+    if not lattices:
+        return NormalVoronoiLattice(
+            capsules=[],
+            seeds=np.zeros((0, 3), dtype=np.float64),
+            cell_planes=[],
+            seed_z_bounds=np.zeros((0, 2), dtype=np.float64),
+            pattern=pattern,
+            pitch=pitch,
+        )
+    if len(lattices) == 1:
+        return lattices[0]
+
+    all_caps: List[Capsule] = []
+    seed_chunks: List[np.ndarray] = []
+    zbnd_chunks: List[np.ndarray] = []
+    all_planes: List[List[CellHalfPlane]] = []
+
+    for lat in lattices:
+        all_caps.extend(lat)
+        if len(lat.seeds) > 0:
+            seed_chunks.append(lat.seeds)
+        if len(lat.seed_z_bounds) > 0:
+            zbnd_chunks.append(lat.seed_z_bounds)
+        all_planes.extend(lat.cell_planes)
+
+    seeds = np.vstack(seed_chunks) if seed_chunks else np.zeros((0, 3), dtype=np.float64)
+    z_bounds = np.vstack(zbnd_chunks) if zbnd_chunks else np.zeros((0, 2), dtype=np.float64)
+    return NormalVoronoiLattice(
+        capsules=all_caps,
+        seeds=seeds,
+        cell_planes=all_planes,
+        seed_z_bounds=z_bounds,
+        pattern=lattices[0].pattern,
+        pitch=lattices[0].pitch,
+    )
+
+
 def clip_voronoi_cell_2d(
     planes: List[CellHalfPlane],
     z_k: float,

@@ -37,6 +37,7 @@ from .geometry import (
     safe_difference,
     safe_intersection,
     safe_union,
+    split_mesh_bodies,
 )
 from .mesh_ops import (
     SimplifiedFace,
@@ -66,7 +67,7 @@ __all__ = [
     "VolumetricField", "center_mesh_on_bed", "clean_geom", "create_test_curved_wall_mesh",
     "create_test_sphere_mesh", "disk_kernel", "extract_polylines", "iter_polygons",
     "load_and_center_mesh", "rasterize_geom", "safe_buffer", "safe_difference",
-    "safe_intersection", "safe_union",
+    "safe_intersection", "safe_union", "split_mesh_bodies",
     "SimplifiedFace", "compute_placeable_faces", "cut_mesh_by_plane",
     "normalize_base_mesh", "rotation_matrix_aligning_vectors",
     "CATEGORY_FIELDS", "CATEGORY_LABELS", "PRESET_CATEGORIES", "Preset", "PresetManager",

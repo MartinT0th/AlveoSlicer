@@ -26,7 +26,7 @@ class TestUISmoke(unittest.TestCase):
             "with tempfile.TemporaryDirectory() as tmp:\n"
             "    pm = PresetManager(user_dir=Path(tmp))\n"
             "    win = AlveoSlicerWindow(preset_manager=pm)\n"
-            "    assert win.tabs.count() == 7, win.tabs.count()\n"
+            "    assert win.tabs.count() == 6, win.tabs.count()\n"
             "    for cat, items in CATEGORY_FIELDS.items():\n"
             "        bound = set(win.settings_tabs[cat]._bindings.keys())\n"
             "        expected = {field_key(sec, attr) for sec, attr in items}\n"
@@ -41,7 +41,7 @@ class TestUISmoke(unittest.TestCase):
             "    assert win.plater.viewport.is_looking_from_bottom, 'Bottom camera must look from underneath Z<0'\n"
             "    win.plater.viewport.set_camera_preset('iso')\n"
             "    assert not win.plater.viewport.is_looking_from_bottom\n"
-            "    win._on_preset_selected('hybrid', 'Standard FFF Only (No Resin / No UV)')\n"
+            "    win._on_preset_selected('print', '0.20mm CELLULAR FFF ONLY (Hexagonal, No Resin/UV)')\n"
             "    assert win.cfg.hybrid.is_fff_only\n"
             "    assert 'STANDARD FFF' in win.plater.lbl_mode_badge.text()\n"
             "    win.plater.set_edit_tool('paint_supports')\n"
@@ -140,11 +140,13 @@ class TestUISmoke(unittest.TestCase):
             "    assert win.scene.selected_instance_id is None, 'Empty-space click must deselect selected model'\n"
             "    vp.plate_selected.emit(1)\n"
             "    assert win.scene.active_plate_idx == 1, f'Expected Plate 2 active, got {win.scene.active_plate_idx}'\n"
-            "    win._on_preset_selected('print', '0.20mm STANDARD FFF (Gyroid 15%)')\n"
+            "    win._on_preset_selected('print', '0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)')\n"
             "    assert win.cfg.infill.infill_engine == 'standard'\n"
             "    assert win.cfg.infill.standard_fill_pattern == 'gyroid'\n"
+            "    assert win.cfg.hybrid.is_fff_only\n"
             "    win._on_preset_selected('print', pm.default_preset_name('print'))\n"
             "    assert win.cfg.infill.infill_engine == 'surface_normal_3d'\n"
+            "    assert not win.cfg.hybrid.is_fff_only\n"
             "    cfg = SlicerConfig()\n"
             "    cfg.fff.layer_height = 0.50\n"
             "    cfg.slice_raster_pitch_mm = 0.50\n"
@@ -193,6 +195,27 @@ class TestUISmoke(unittest.TestCase):
         proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("REQUEST5_UI_ALL_OK", proc.stdout)
+
+    def test_startup_splash_screen_smoke(self) -> None:
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        code = (
+            "from PySide6.QtWidgets import QApplication\n"
+            "from alveoslicer._version import __version__\n"
+            "from alveoslicer.ui.splash import AlveoSplashScreen\n"
+            "app = QApplication([])\n"
+            "splash = AlveoSplashScreen(version=__version__)\n"
+            "splash.set_status('Loading 3D viewport...')\n"
+            "splash._tick_throbber()\n"
+            "pm = splash.grab()\n"
+            "assert not pm.isNull() and pm.width() > 400 and pm.height() > 200\n"
+            "assert splash._version == __version__\n"
+            "splash.finish()\n"
+            "print('SPLASH_SMOKE_OK')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SPLASH_SMOKE_OK", proc.stdout)
 
 
 if __name__ == "__main__":

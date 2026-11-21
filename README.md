@@ -148,9 +148,10 @@ AlveoSlicer/
 │   ├── launch_gui.py                #   Frozen PyInstaller GUI entry point
 │   └── build_exe.py                 #   Single-file Windows AlveoSlicer.exe builder
 ├── alveoslicer/
-│   ├── __init__.py                  # Public Python facade (re-exports core config, scene, pipeline, HALs, parser)
+│   ├── __init__.py                  # Lazy public Python facade (re-exports core config, scene, pipeline, HALs, parser)
 │   ├── __main__.py                  # Enables `python -m alveoslicer`
-│   ├── pipeline.py                  # Unified 6-stage orchestrator (SliceResult, slice_mesh, run_slicer)
+│   ├── _version.py                  # Single source of truth for application version string
+│   ├── pipeline.py                  # Unified 6-stage orchestrator (SliceResult, slice_mesh, run_slicer; multi-body aware)
 │   ├── cli.py                       # Command-line interface & argument parser
 │   │
 │   ├── assets/                      # Bundled application icons & frozen-safe asset path resolver
@@ -161,22 +162,22 @@ AlveoSlicer/
 │   │
 │   ├── core/                        # Configuration, geometry, mesh operations, scene & presets
 │   │   ├── config.py                #   JSON-serializable dataclasses (FFF, Infill, Resin, UV, Printer, Hybrid, SlicerConfig)
-│   │   ├── geometry.py              #   Multi-format mesh loader, test shapes, VolumetricField SDF, topology-safe Shapely ops
+│   │   ├── geometry.py              #   Multi-format mesh loader, body splitter, VolumetricField SDF, topology-safe Shapely ops
 │   │   ├── mesh_ops.py              #   Simplified Place-on-Face clustering & watertight 3D plane cutting
 │   │   ├── scene.py                 #   Multi-plate WorkspaceScene, BuildPlate, ModelInstance, auto-arrange, paint-on masks
-│   │   ├── presets_data.py          #   Built-in factory preset definitions across all 5 categories
+│   │   ├── presets_data.py          #   Built-in factory preset definitions across all 4 categories
 │   │   └── presets.py               #   PresetManager (load/save/delete user presets, modified tracking, CATEGORY_FIELDS)
 │   │
 │   ├── infill/                      # Dual infill synthesis engines
 │   │   ├── lattice.py               #   Capsule, CellHalfPlane, NormalVoronoiLattice & 2D Sutherland-Hodgman clipper
-│   │   ├── surface_normal.py        #   Stage 2–3: 8 3D surface-normal cellular & Gyroid TPMS generators
+│   │   ├── surface_normal.py        #   Stage 2–3: 8 per-body 3D surface-normal cellular & Gyroid TPMS generators
 │   │   └── standard.py              #   17 classic PrusaSlicer 2D/3D infill patterns & 7 top/bottom surface patterns
 │   │
 │   ├── slicing/                     # Exact-vector planar slicing, supports & bed adhesion
 │   │   ├── layer.py                 #   SlicedLayer dataclass (vector paths + 2D resin/solid/void raster masks)
 │   │   ├── supports.py              #   Grid/Snug/Organic/Pillars external supports, paint-on masks & dry-core supports
 │   │   ├── adhesion.py              #   Skirt, draft shield, outer/inner/both brim & wipe/purge tower builders
-│   │   └── engine.py                #   Exact-vector per-layer slicing engine uniting shells, infill, supports & adhesion
+│   │   └── engine.py                #   Exact-vector per-body & per-layer slicing engine uniting shells, infill, supports & adhesion
 │   │
 │   ├── hybrid/                      # Photopolymer cure scheduling & volumetric dosing
 │   │   ├── scheduler.py             #   Stage 4: Global DP cure-cycle scheduler with hard-roof cadence rebalancing
@@ -191,9 +192,10 @@ AlveoSlicer/
 │   │       └── corexy.py            #   CoreXYToolchangerHAL (docked T0=FFF, T1=Resin, T2=UV toolheads)
 │   │
 │   └── ui/                          # PySide6 PrusaSlicer-style desktop GUI
-│       ├── __init__.py              #   Exports AlveoSlicerWindow and main()
+│       ├── __init__.py              #   Lazy exports for AlveoSlicerWindow, AlveoSplashScreen, and main()
 │       ├── __main__.py              #   Enables `python -m alveoslicer.ui`
-│       ├── app.py                   #   QApplication bootstrap & Windows taskbar AppUserModelID icon setup
+│       ├── app.py                   #   QApplication bootstrap, startup splash screen & Windows taskbar icon setup
+│       ├── splash.py                #   Frameless PyCharm/PrusaSlicer-style startup splash card with animated throbber
 │       ├── main_window.py           #   AlveoSlicerWindow orchestrating tabs, menus, themes, multi-plate & slicing queue
 │       ├── worker.py                #   Background QThread SliceWorker
 │       ├── styling/
@@ -211,9 +213,9 @@ AlveoSlicer/
 │       │   └── view.py              #   PlaterView coordinating viewport overlays, mode toggles & move playback
 │       ├── settings/
 │       │   ├── base_tab.py          #   Two-pane PrusaSlicer-style CategorySettingsTab base class & preset bar
-│       │   ├── print_tab.py         #   Print Settings tab (Layers, Dual Infill, Adhesion, Supports, Speed, Wipe Tower)
+│       │   ├── print_tab.py         #   Unified Print Settings tab (Layers, Dual Infill, Supports, Speed, Hybrid Mode, Pump & UV)
 │       │   ├── material_tabs.py     #   Filament Settings & Photopolymer Resin Settings tabs
-│       │   └── machine_tabs.py      #   Printer Settings & Hybrid Process / UV Curing Settings tabs
+│       │   └── machine_tabs.py      #   Printer Settings tab
 │       └── views/
 │           ├── inspector_2d.py      #   2D Matplotlib layer & fluid basin cross-section inspector
 │           ├── schedule_view.py     #   Clickable DP UV Cure Schedule table
@@ -287,16 +289,15 @@ Once built, copy or move `dist/AlveoSlicer.exe` anywhere on your PC (such as you
 
 ### 6.1 Desktop Workspace Overview
 
-AlveoSlicer opens with **7 top-level tabs** modeled directly after PrusaSlicer, plus a live **Dark / Light / System** theme switcher in the top-right corner:
+AlveoSlicer launches with a crisp startup splash screen and opens with **6 top-level tabs** modeled directly after PrusaSlicer, plus a live **Dark / Light / System** theme switcher in the top-right corner:
 
 | Tab | Purpose |
 | --- | --- |
 | **Plater** | 3D multi-bed build workspace, floating viewport tools, presets sidebar, slicing controls, 3D G-Code Previewer, and 2D Basin Inspector |
-| **Print Settings** | Layers & Perimeters, Infill (Dual Engine), Skirt/Brim/Draft Shield, Supports, Speed/Accel, Wipe Tower, and Output Options |
+| **Print Settings** | Layers & Perimeters, Infill (Dual Engine), Skirt/Brim/Draft Shield, Supports, Speed/Accel, Wipe Tower, **Hybrid Mode** (Enable Resin Pumping / Enable UV Curing), **Resin Pump & Needle**, **UV Hardening**, and Output Options |
 | **Filament** | Filament diameter, density, cost, extrusion multiplier, first-layer & running temperatures, cooling fan ramp, retraction & Z-hop |
-| **Resin** | Photopolymer Beer-Lambert cure parameters, slab limits, DP scheduler weights, ghost-island threshold, needle radius, pump calibration & dwell |
+| **Resin** | Photopolymer Beer-Lambert cure parameters, slab limits, DP scheduler weights, and ghost-island threshold |
 | **Printer** | Machine profile (`bedslinger_prototype` / `corexy_toolchanger`), bed size & shape, Z-offset, tool indices, needle offsets, UV shield park, custom G-code hooks |
-| **Hybrid** | Independent **Enable Resin Pumping** and **Enable UV Curing** master switches (disable both for Standard FFF printers) + UV irradiance, beam width, scan speed & passes |
 | **Schedule & Log** | Clickable DP UV Cure Cycle table (click any row to jump directly to that layer in the Plater) + live pipeline log and raw G-code text preview |
 
 ### 6.2 3D Viewport Navigation & Shortcuts
@@ -333,7 +334,7 @@ AlveoSlicer opens with **7 top-level tabs** modeled directly after PrusaSlicer, 
 ### 6.3 Multi-Plate & Object Manipulation Workflow
 
 1. **Import or Create Models:** Click **Add** in the top floating viewport bar (or use the built-in **Test Sphere** / **Test Curved Wall** buttons to experiment immediately).
-2. **Arrange & Clone:** Use **Clone** (`Ctrl+D`), **Auto-Arrange** (`A`), **Center**, **Drop to Bed**, or exact **Pos / Rot / Scale** spinboxes in the right **Object Manipulation** card. Toggle **Lock uniform scale** for proportional or non-uniform scaling.
+2. **Arrange & Clone:** Use **Clone** (`Ctrl+D`), **Auto-Arrange** (`A`), **Center**, **Drop to Bed**, or exact **Pos / Rot / Scale** spinboxes in the right **Object Manipulation** card. Toggle **Lock uniform scale** for proportional or non-uniform scaling. When multiple bodies sit on the same build plate, each body automatically receives its own independent 3D cellular wireframe and is sliced separately.
 3. **Place on Face (`F`):** Press `F` to highlight simplified planar landing faces on the selected model in translucent cyan. Click any face to rotate the model so that face sits flush on `Z = 0`.
 4. **Multiple Build Plates:** Click **Add Plate** (`Ctrl+N`) in the top bar to add independent print beds arranged side-by-side in 3D space. Use **To Plate...** in the Build Plate Objects card to transfer models between plates, or click **Slice All Plates** to queue and slice every populated bed sequentially.
 
@@ -357,14 +358,14 @@ Press **`L`** (or click the Paint-on Supports icon) to paint custom support regi
 
 ### 6.6 Settings Categories, Dual Infill Engines & Presets
 
-- **Presets Sidebar:** Every category (**Print**, **Filament**, **Resin**, **Printer**, **Hybrid**) ships with built-in presets. Selecting a preset updates the configuration immediately; editing any parameter marks the category `* modified`. Use the **Save / Save As / Revert / Delete** toolbar inside any settings tab to manage persistent custom user presets (stored in `~/.alveoslicer/presets/`).
+- **Presets Sidebar:** Every category (**Print**, **Filament**, **Resin**, **Printer**) ships with built-in presets. Selecting a preset updates the configuration immediately; editing any parameter marks the category `* modified`. Use the **Save / Save As / Revert / Delete** toolbar inside any settings tab to manage persistent custom user presets (stored in `~/.alveoslicer/presets/`).
 - **Switching Between Hybrid & Standard FFF Only:**
-  - In the Plater's **Hybrid Process** dropdown (or the **Hybrid** tab), select **Standard FFF Only (No Resin / No UV)** to turn off both photopolymer dosing and UV curing. The Slice Summary banner updates to **`STANDARD FFF ONLY`**, and exported G-code uses a single extruder (`T0`) compatible with any standard FFF printer.
+  - In the Plater's **Print Settings** dropdown (or **Print Settings → Hybrid Mode**), select **`0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)`** or **`0.20mm CELLULAR FFF ONLY (Hexagonal, No Resin/UV)`** (or uncheck **Enable Resin Pumping** and **Enable UV Curing**) to turn off photopolymer dosing and UV curing. The Slice Summary banner updates to **`STANDARD FFF ONLY`**, and exported G-code uses a single extruder (`T0`) compatible with any standard FFF printer.
 - **Switching Between 3D Surface-Normal & Standard Infill:**
   - Open **Print Settings → Infill** and select **Infill Engine**:
     - **`3D Surface-Normal Cellular / TPMS`** for hybrid photopolymer alveoli (`hexagonal`, `gyroid`, `cubic`, `diamond`, `triangular`, `voronoi`, `square`, `brick`).
-    - **`Standard PrusaSlicer Infill`** for classic 2D/3D FFF infills (`gyroid`, `grid`, `rectilinear`, `honeycomb`, `cubic`, `adaptive_cubic`, `lightning`, `hilbert_curve`, etc.), or choose the built-in **`0.20mm STANDARD FFF (Gyroid 15%)`** print preset directly from the sidebar.
-- **Full JSON Profiles:** Use **File → Export Config JSON...** and **File → Import Config JSON...** to share or archive complete 5-category configurations.
+    - **`Standard PrusaSlicer Infill`** for classic 2D/3D FFF infills (`gyroid`, `grid`, `rectilinear`, `honeycomb`, `cubic`, `adaptive_cubic`, `lightning`, `hilbert_curve`, etc.), or choose a built-in **`STANDARD FFF`** print preset directly from the sidebar.
+- **Full JSON Profiles:** Use **File → Export Config JSON...** and **File → Import Config JSON...** to share or archive complete 4-category configurations.
 
 ### 6.7 Slicing, G-Code Previewer & 2D Basin Inspector
 

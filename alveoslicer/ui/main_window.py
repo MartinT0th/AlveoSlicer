@@ -1,7 +1,7 @@
 """Main PrusaSlicer-style desktop window orchestrating multi-plate Plater, Settings, Presets, and Slicing.
 
 :class:`AlveoSlicerWindow` connects the headless slicing engine and multi-plate
-:class:`WorkspaceScene` to the 3D Plater tab, five categorized PrusaSlicer-style
+:class:`WorkspaceScene` to the 3D Plater tab, four categorized PrusaSlicer-style
 settings tabs, Cure Schedule & Pipeline Log view, Dark/Light/System theme
 switcher, and background :class:`SliceWorker`.
 """
@@ -43,7 +43,6 @@ from .plater import PlaterView
 from .settings import (
     CategorySettingsTab,
     build_filament_settings_tab,
-    build_hybrid_settings_tab,
     build_print_settings_tab,
     build_printer_settings_tab,
     build_resin_settings_tab,
@@ -145,20 +144,18 @@ class AlveoSlicerWindow(QMainWindow):
         plater_idx = self.tabs.addTab(self.plater, "Plater")
         self._tab_icon_names[plater_idx] = "view_3d"
 
-        # Tabs 1..5: Per-category Settings Tabs
+        # Tabs 1..4: Per-category Settings Tabs (Print Settings includes Hybrid & UV)
         builders = {
             "print": build_print_settings_tab,
             "filament": build_filament_settings_tab,
             "resin": build_resin_settings_tab,
             "printer": build_printer_settings_tab,
-            "hybrid": build_hybrid_settings_tab,
         }
         cat_icons = {
             "print": "layers",
             "filament": "filament",
             "resin": "resin",
             "printer": "printer",
-            "hybrid": "uv",
         }
         self.settings_tabs: Dict[str, CategorySettingsTab] = {}
         self._category_tab_indices: Dict[str, int] = {}
@@ -371,7 +368,7 @@ class AlveoSlicerWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _init_presets_and_config(self) -> None:
-        """Load the default built-in preset for each of the five settings categories."""
+        """Load the default built-in preset for each of the four settings categories."""
         for cat in PRESET_CATEGORIES:
             default_name = self.preset_manager.default_preset_name(cat)
             self.preset_manager.apply_preset(self.cfg, cat, default_name)
@@ -862,7 +859,7 @@ class AlveoSlicerWindow(QMainWindow):
             f"=== Slicing {plate.name}: {', '.join(i.name for i in plate.instances)} ==="
         )
 
-        self.worker = SliceWorker(mesh, cfg)
+        self.worker = SliceWorker(mesh, cfg, bodies=plate.instance_meshes())
         self.worker.progress.connect(
             lambda pct, msg, pname=plate.name: self.plater.set_progress(pct, f"[{pname}] {msg}")
         )
@@ -972,7 +969,7 @@ class AlveoSlicerWindow(QMainWindow):
     # -------------------------------------------------------------------------
 
     def _export_config_json(self) -> None:
-        """Serialize the complete :class:`SlicerConfig` across all 5 categories to JSON."""
+        """Serialize the complete :class:`SlicerConfig` across all 4 categories to JSON."""
         cfg = self._collect_full_config()
         path, _ = QFileDialog.getSaveFileName(
             self, "Export Full Config JSON", "alveoslicer_config.json", "JSON (*.json)"

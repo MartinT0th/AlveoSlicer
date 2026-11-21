@@ -202,6 +202,90 @@ class TestInfillAndSlicing(unittest.TestCase):
             total_infill = sum(len(ly.inside_perimeter_lines) for ly in res.layers)
             self.assertGreater(total_infill, 5, f"Standard infill pattern '{pat}' emitted too few lines")
 
+    def test_multi_body_independent_3d_cellular_wireframes_and_slicing(self) -> None:
+        """Each separated body on a build plate must generate its own 3D cellular wireframe & sliced cells."""
+        cfg = SlicerConfig()
+        cfg.fff.layer_height = 0.60
+        cfg.slice_raster_pitch_mm = 0.60
+        cfg.voxel_pitch_mm = 0.90
+        cfg.infill.infill_engine = "surface_normal_3d"
+        cfg.infill.pattern = "hexagonal"
+        cfg.infill.target_cell_pitch = 8.0
+
+        scene = WorkspaceScene()
+        base_wall = create_test_curved_wall_mesh(cfg)
+        x_positions = (45.0, 110.0, 175.0)
+        for i, pos_x in enumerate(x_positions):
+            inst = scene.add_mesh(base_wall.copy(), f"Wall_{i + 1}", 220.0, 220.0)
+            inst.pos_x = pos_x
+            inst.pos_y = 110.0
+
+        bodies = scene.active_plate.instance_meshes()
+        self.assertEqual(len(bodies), 3)
+        combined = scene.active_plate.combined_mesh()
+        self.assertIsNotNone(combined)
+
+        # Test both explicit per-instance bodies (UI path) and auto-split combined mesh (CLI/multi-shell STL path)
+        for mode_label, res in (
+            ("explicit_bodies", slice_mesh(combined, cfg, bodies=bodies)),
+            ("auto_split_combined", slice_mesh(combined, cfg)),
+        ):
+            self.assertGreater(len(res.capsules), 15, f"{mode_label}: expected 3D wireframe capsules")
+            self.assertGreater(len(res.schedule), 0, f"{mode_label}: expected hybrid UV cure cycles")
+
+            # Verify every single body has its own 3D wireframe capsules inside its XY bounding box
+            for b_idx, body in enumerate(bodies):
+                bmin, bmax = body.bounds
+                body_caps = [
+                    c for c in res.capsules
+                    if (bmin[0] - 2.0 <= 0.5 * (c.a[0] + c.b[0]) <= bmax[0] + 2.0)
+                    and (bmin[1] - 2.0 <= 0.5 * (c.a[1] + c.b[1]) <= bmax[1] + 2.0)
+                ]
+                self.assertGreater(
+                    len(body_caps),
+                    5,
+                    f"{mode_label}: body {b_idx} (X={bmin[0]:.1f}..{bmax[0]:.1f}) missing 3D cellular wireframe!",
+                )
+
+                # Verify each body also received internal cellular walls and resin void pockets on mid-layers
+                mid_layer = res.layers[len(res.layers) // 2]
+                infill_in_body = [
+                    ln for ln in mid_layer.inside_perimeter_lines
+                    if (bmin[0] - 1.0 <= float(np.mean(ln[:, 0])) <= bmax[0] + 1.0)
+                    and (bmin[1] - 1.0 <= float(np.mean(ln[:, 1])) <= bmax[1] + 1.0)
+                ]
+                self.assertGreater(
+                    len(infill_in_body),
+                    0,
+                    f"{mode_label}: body {b_idx} missing internal cellular walls on mid-layer {mid_layer.layer_idx}",
+                )
+                xs, ys = res.xs, res.ys
+                x_sel = (xs >= bmin[0]) & (xs <= bmax[0])
+                y_sel = (ys >= bmin[1]) & (ys <= bmax[1])
+                body_void_px = int(np.count_nonzero(mid_layer.void_mask[np.ix_(x_sel, y_sel)]))
+                self.assertGreater(
+                    body_void_px,
+                    0,
+                    f"{mode_label}: body {b_idx} missing resin void pockets on mid-layer {mid_layer.layer_idx}",
+                )
+
+        # Verify mixed-height bodies (curved wall + shorter sphere) get independent top caps & wireframes
+        mixed_scene = WorkspaceScene()
+        w_inst = mixed_scene.add_mesh(create_test_curved_wall_mesh(cfg), "Wall", 220.0, 220.0)
+        w_inst.pos_x, w_inst.pos_y = 65.0, 110.0
+        s_inst = mixed_scene.add_mesh(create_test_sphere_mesh(cfg, radius=11.0), "Sphere", 220.0, 220.0)
+        s_inst.pos_x, s_inst.pos_y = 155.0, 110.0
+        mixed_bodies = mixed_scene.active_plate.instance_meshes()
+        mixed_res = slice_mesh(mixed_scene.active_plate.combined_mesh(), cfg, bodies=mixed_bodies)
+        for b_idx, body in enumerate(mixed_bodies):
+            bmin, bmax = body.bounds
+            body_caps = [
+                c for c in mixed_res.capsules
+                if (bmin[0] - 2.0 <= 0.5 * (c.a[0] + c.b[0]) <= bmax[0] + 2.0)
+                and (bmin[1] - 2.0 <= 0.5 * (c.a[1] + c.b[1]) <= bmax[1] + 2.0)
+            ]
+            self.assertGreater(len(body_caps), 3, f"Mixed body {b_idx} missing 3D wireframe")
+
 
 if __name__ == "__main__":
     unittest.main()

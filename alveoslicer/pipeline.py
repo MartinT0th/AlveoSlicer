@@ -10,12 +10,13 @@ import numpy as np
 import trimesh
 
 from .core.config import SlicerConfig
-from .core.geometry import VolumetricField
+from .core.geometry import VolumetricField, split_mesh_bodies
 from .gcode.hal import create_hal
 from .gcode.toolpath import generate_fff_paths_for_layer
 from .hybrid.dosing import DosingPoint, plan_cycle_dosing
 from .hybrid.scheduler import CureCycle, compute_optimal_cure_schedule
 from .infill import Capsule, NormalVoronoiLattice, generate_normal_dendritic_infill
+from .infill.lattice import combine_lattices
 from .slicing import SlicedLayer, slice_model_to_layers
 
 ProgressCallback = Callable[[int, str], None]
@@ -41,13 +42,26 @@ class SliceResult:
     est_print_time_s: float = 0.0
 
 
+def _resolve_slice_bodies(
+    mesh: trimesh.Trimesh,
+    bodies: Optional[List[trimesh.Trimesh]],
+) -> List[trimesh.Trimesh]:
+    """Expand explicit instance meshes or a combined mesh into independent connected solid bodies."""
+    sources = [b for b in bodies if len(b.faces) > 0] if bodies else [mesh]
+    resolved: List[trimesh.Trimesh] = []
+    for src in sources:
+        resolved.extend(split_mesh_bodies(src))
+    return resolved or [mesh]
+
+
 def slice_mesh(
     mesh: trimesh.Trimesh,
     cfg: SlicerConfig,
     on_progress: Optional[ProgressCallback] = None,
     on_log: Optional[LogCallback] = None,
+    bodies: Optional[List[trimesh.Trimesh]] = None,
 ) -> SliceResult:
-    """Execute all 6 slicing stages on ``mesh`` and return a complete ``SliceResult``."""
+    """Execute all 6 slicing stages on ``mesh`` (slicing each disconnected body independently)."""
 
     def _progress(pct: int, msg: str) -> None:
         if on_progress is not None:
@@ -57,42 +71,72 @@ def slice_mesh(
         if on_log is not None:
             on_log(msg)
 
+    resolved_bodies = _resolve_slice_bodies(mesh, bodies)
+    n_bodies = len(resolved_bodies)
+    if n_bodies > 1:
+        _log(f"[Scene] Detected {n_bodies} independent solid bodies — synthesizing & slicing each separately.")
+
+    body_lattices: List[NormalVoronoiLattice] = []
     if str(cfg.infill.infill_engine).lower() == "standard":
         _progress(22, "Stage 2-3: Preparing Standard PrusaSlicer Infill engine...")
         _log(
             f"[Stage 2-3] Using Standard PrusaSlicer Infill engine "
             f"(pattern={cfg.infill.standard_fill_pattern}, density={cfg.infill.fill_density_pct:.1f}%)..."
         )
-        field = VolumetricField(mesh, pitch=max(1.2, cfg.voxel_pitch_mm))
-        lattice = NormalVoronoiLattice(
-            capsules=[],
-            seeds=np.zeros((0, 3), dtype=np.float64),
-            cell_planes=[],
-            seed_z_bounds=np.zeros((0, 2), dtype=np.float64),
-            pattern=cfg.infill.standard_fill_pattern,
-            pitch=cfg.infill.target_cell_pitch,
-        )
+        field = VolumetricField(resolved_bodies[0], pitch=max(1.2, cfg.voxel_pitch_mm))
+        for _ in resolved_bodies:
+            body_lattices.append(
+                NormalVoronoiLattice(
+                    capsules=[],
+                    seeds=np.zeros((0, 3), dtype=np.float64),
+                    cell_planes=[],
+                    seed_z_bounds=np.zeros((0, 2), dtype=np.float64),
+                    pattern=cfg.infill.standard_fill_pattern,
+                    pitch=cfg.infill.target_cell_pitch,
+                )
+            )
+        lattice = body_lattices[0]
     else:
-        _progress(5, "Stage 1: Building lightweight 3D surface field...")
-        _log(f"[Stage 1] Building lightweight surface field (pitch={cfg.voxel_pitch_mm} mm)...")
-        field = VolumetricField(mesh, pitch=cfg.voxel_pitch_mm)
-
-        _progress(22, "Stage 2-3: Synthesizing 3D surface-normal cellular infill...")
         _log(
-            f"[Stage 2-3] Synthesizing 3D outer-surface {cfg.infill.pattern} pattern "
+            f"[Stage 1-2] Synthesizing 3D outer-surface {cfg.infill.pattern} pattern "
             f"(mode={cfg.infill.mode}, pitch={cfg.infill.target_cell_pitch} mm, "
             f"resin_channel={cfg.infill.min_channel_clearance} mm, "
-            f"flatten_angle=<{cfg.infill.flatten_angle_deg} deg)..."
+            f"flatten_angle=<{cfg.infill.flatten_angle_deg} deg) across {n_bodies} body/bodies..."
         )
-        lattice = generate_normal_dendritic_infill(field, cfg)
-        _log(f"            Placed {len(lattice.seeds)} cells ({len(lattice)} 3D wireframe edges).")
+        field = None
+        for b_idx, b_mesh in enumerate(resolved_bodies):
+            pct = 5 + int(32 * b_idx / max(1, n_bodies))
+            label = f"body {b_idx + 1}/{n_bodies}" if n_bodies > 1 else "model"
+            _progress(pct, f"Stage 1-2: Synthesizing 3D cellular lattice ({label})...")
+            b_field = VolumetricField(b_mesh, pitch=cfg.voxel_pitch_mm)
+            if field is None:
+                field = b_field
+            b_lattice = generate_normal_dendritic_infill(b_field, cfg)
+            body_lattices.append(b_lattice)
+            _log(
+                f"            Body {b_idx + 1}/{n_bodies}: placed {len(b_lattice.seeds)} cells "
+                f"({len(b_lattice)} 3D wireframe edges)."
+            )
+        assert field is not None
+        lattice = combine_lattices(
+            body_lattices,
+            pattern=cfg.infill.pattern,
+            pitch=cfg.infill.target_cell_pitch,
+        )
 
-    _progress(42, "Stage 3: Exact analytical vector XY slicing...")
+    _progress(42, f"Stage 3: Exact analytical vector XY slicing ({n_bodies} body/bodies)...")
     _log(
         f"[Stage 3] Exact vector XY slicing (h={cfg.fff.layer_height} mm, "
-        f"raster={cfg.slice_raster_pitch_mm} mm)..."
+        f"raster={cfg.slice_raster_pitch_mm} mm, bodies={n_bodies})..."
     )
-    layers, xs, ys = slice_model_to_layers(mesh, field, lattice, cfg)
+    layers, xs, ys = slice_model_to_layers(
+        mesh,
+        field,
+        lattice,
+        cfg,
+        bodies=resolved_bodies,
+        body_lattices=body_lattices,
+    )
     _log(f"          Sliced {len(layers)} exact vector layers.")
 
     if cfg.hybrid.is_fff_only:

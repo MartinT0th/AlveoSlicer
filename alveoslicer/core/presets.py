@@ -81,7 +81,7 @@ def _build_default_presets() -> Dict[str, List[Preset]]:
 
 
 class PresetManager:
-    """Manages factory built-in and persistent JSON user presets across all 5 settings categories."""
+    """Manages factory built-in and persistent JSON user presets across all 4 settings categories."""
 
     def __init__(self, user_dir: Optional[Path] = None) -> None:
         """Initialize the preset store and load any saved user JSON files from ``user_dir``."""

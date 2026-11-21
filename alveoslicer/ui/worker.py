@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import traceback
+from typing import List, Optional
 
 import trimesh
 from PySide6.QtCore import QThread, Signal
@@ -19,10 +20,16 @@ class SliceWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, mesh: trimesh.Trimesh, cfg: SlicerConfig) -> None:
-        """Store an isolated copy of ``mesh`` and the slicing configuration."""
+    def __init__(
+        self,
+        mesh: trimesh.Trimesh,
+        cfg: SlicerConfig,
+        bodies: Optional[List[trimesh.Trimesh]] = None,
+    ) -> None:
+        """Store an isolated copy of ``mesh``, optional per-body meshes, and the slicing configuration."""
         super().__init__()
         self.mesh = mesh.copy()
+        self.bodies = [b.copy() for b in bodies] if bodies is not None else None
         self.cfg = cfg
 
     def run(self) -> None:
@@ -33,6 +40,7 @@ class SliceWorker(QThread):
                 self.cfg,
                 on_progress=self.progress.emit,
                 on_log=self.log_msg.emit,
+                bodies=self.bodies,
             )
             self.finished_ok.emit(result)
         except Exception:

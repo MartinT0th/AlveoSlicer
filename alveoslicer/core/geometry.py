@@ -314,3 +314,38 @@ def disk_kernel(radius_px: int) -> np.ndarray:
     r = max(1, radius_px)
     yy, xx = np.ogrid[-r : r + 1, -r : r + 1]
     return (xx * xx + yy * yy) <= (r * r)
+
+
+def split_mesh_bodies(mesh: trimesh.Trimesh) -> List[trimesh.Trimesh]:
+    """Split a multi-body mesh into independent connected solid submeshes, preserving ``paint_support``."""
+    n_faces = len(mesh.faces)
+    if n_faces == 0:
+        return []
+    try:
+        comps = trimesh.graph.connected_components(
+            mesh.face_adjacency, nodes=np.arange(n_faces), min_len=4
+        )
+    except Exception:
+        return [mesh]
+
+    if len(comps) <= 1:
+        return [mesh]
+
+    paint = mesh.metadata.get("paint_support") if isinstance(mesh.metadata, dict) else None
+    has_paint = paint is not None and len(paint) == n_faces
+    paint_arr = np.asarray(paint, dtype=np.int8) if has_paint else None
+
+    bodies: List[trimesh.Trimesh] = []
+    for face_idx in comps:
+        idx_arr = np.asarray(face_idx, dtype=np.int64)
+        sub = mesh.submesh([idx_arr], append=True)
+        if not isinstance(sub, trimesh.Trimesh) or len(sub.faces) < 4:
+            continue
+        if paint_arr is not None:
+            sub.metadata["paint_support"] = paint_arr[idx_arr].copy()
+        bodies.append(sub)
+
+    if not bodies:
+        return [mesh]
+    bodies.sort(key=lambda m: (float(m.bounds[0, 0]), float(m.bounds[0, 1]), float(m.bounds[0, 2])))
+    return bodies

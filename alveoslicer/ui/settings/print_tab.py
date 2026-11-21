@@ -355,7 +355,90 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     tab.add_post_change_hook(_sync_wt)
     tab.add_section("Wipe tower", make_page_container([g_wt]), "tower")
 
-    # ---- 7. Advanced (Extrusion widths & Engine Precision) ----
+    # ---- 7. Hybrid Mode, Resin Pump & Needle, and UV Hardening ----
+    r, u, h = cfg.resin, cfg.uv, cfg.hybrid
+
+    g_hmode, fhm = make_card("Hybrid Process Switches")
+    banner = QLabel()
+    banner.setWordWrap(True)
+    chk_pump = tab.bind_checkbox(
+        "hybrid.enable_resin_pumping",
+        "Enable Photopolymer Pumping (resin && needle dosing G-code)",
+        h.enable_resin_pumping,
+        tooltip="Uncheck together with UV Curing to export clean G-code for a regular FFF printer.",
+    )
+    chk_uv = tab.bind_checkbox(
+        "hybrid.enable_uv_curing",
+        "Enable In-Situ UV Curing (UV LED sweeps && ON/OFF G-code)",
+        h.enable_uv_curing,
+        tooltip="Uncheck together with Photopolymer Pumping to export clean G-code for a regular FFF printer.",
+    )
+    fhm.addRow(banner)
+    fhm.addRow(chk_pump)
+    fhm.addRow(chk_uv)
+
+    note_fff = QLabel(
+        "Tip: Disabling both Photopolymer Pumping and UV Curing keeps AlveoSlicer's 3D surface-normal "
+        "cellular geometry while emitting clean single-extruder G-code ready for any standard FFF printer."
+    )
+    note_fff.setObjectName("mutedLabel")
+    note_fff.setWordWrap(True)
+    fhm.addRow(note_fff)
+
+    g_pump, fpump = make_card("Dispenser Pump && Needle Geometry")
+    tab.add_dspin_rows(fpump, [
+        ("Needle outer radius:", "resin.needle_outer_radius_mm", r.needle_outer_radius_mm, 0.1, 3.0, 0.05, 2, "mm"),
+        ("Needle wall safety clearance:", "resin.needle_safety_clear_mm", r.needle_safety_clear_mm, 0.0, 2.0, 0.05, 2, "mm"),
+        ("Pump calibration:", "resin.pump_mm3_per_e_mm", r.pump_mm3_per_e_mm, 0.05, 50.0, 0.1, 3, "mm³/E"),
+        ("Dispense speed:", "resin.dispense_speed_e_mm_s", r.dispense_speed_e_mm_s, 0.5, 50.0, 0.5, 1, "mm/s"),
+        ("Suck-back retraction:", "resin.suckback_e_mm", r.suckback_e_mm, 0.0, 10.0, 0.1, 2, "mm"),
+        ("Suck-back speed:", "resin.suckback_speed_e_mm_s", r.suckback_speed_e_mm_s, 1.0, 80.0, 1.0, 1, "mm/s"),
+    ])
+
+    g_uv, fuv = make_card("UV Optics && Thermal Split-Passes")
+    tab.add_dspin_rows(fuv, [
+        ("UV irradiance:", "uv.irradiance_mw_cm2", u.irradiance_mw_cm2, 1.0, 500.0, 1.0, 1, "mW/cm²"),
+        ("Beam width:", "uv.beam_width_cm", u.beam_width_cm, 0.1, 20.0, 0.1, 2, "cm"),
+        ("Target dose / mm:", "uv.target_dose_mj_cm2_per_mm", u.target_dose_mj_cm2_per_mm, 5.0, 1000.0, 5.0, 1, "mJ/cm²/mm"),
+    ])
+    fuv.addRow("Min thermal passes:", tab.bind_spin("uv.min_passes", u.min_passes, 1, 12))
+    fuv.addRow("Inter-pass cooldown:", tab.bind_spin("uv.inter_pass_cooldown_ms", u.inter_pass_cooldown_ms, 0, 20000, 250, "ms"))
+    tab.add_dspin_rows(fuv, [
+        ("Focal Z clearance:", "uv.focal_z_clearance_mm", u.focal_z_clearance_mm, 2.0, 150.0, 1.0, 1, "mm"),
+        ("Min scan speed:", "uv.min_scan_speed_mm_s", u.min_scan_speed_mm_s, 0.5, 100.0, 0.5, 1, "mm/s"),
+        ("Max scan speed:", "uv.max_scan_speed_mm_s", u.max_scan_speed_mm_s, 1.0, 200.0, 2.0, 1, "mm/s"),
+    ])
+    fuv.addRow("UV ON G-code:", tab.bind_line_edit("uv.uv_on_gcode", u.uv_on_gcode, fallback="M106 P2 S255"))
+    fuv.addRow("UV OFF G-code:", tab.bind_line_edit("uv.uv_off_gcode", u.uv_off_gcode, fallback="M106 P2 S0"))
+
+    def _sync_hybrid_toggles() -> None:
+        p_on, u_on = chk_pump.isChecked(), chk_uv.isChecked()
+        g_pump.setEnabled(p_on)
+        g_uv.setEnabled(u_on)
+        if not p_on and not u_on:
+            banner.setObjectName("modeBannerFFF")
+            banner.setText(
+                "Standard FFF Mode Active — Resin pumping and UV curing are disabled. "
+                "Output G-code is clean single-extruder FFF ready for any regular 3D printer."
+            )
+        elif p_on and u_on:
+            banner.setObjectName("modeBannerHybrid")
+            banner.setText("Full Hybrid Mode Active — Photopolymer dosing and in-situ UV curing sweeps are enabled.")
+        elif p_on:
+            banner.setObjectName("modeBannerFFF")
+            banner.setText("Partial Hybrid Mode — Photopolymer pumping ON, in-situ UV curing OFF.")
+        else:
+            banner.setObjectName("modeBannerFFF")
+            banner.setText("Partial Hybrid Mode — Photopolymer pumping OFF, in-situ UV curing ON.")
+        banner.style().unpolish(banner)
+        banner.style().polish(banner)
+
+    tab.add_post_change_hook(_sync_hybrid_toggles)
+    tab.add_section("Hybrid Mode", make_page_container([g_hmode]), "uv")
+    tab.add_section("Resin Pump & Needle", make_page_container([g_pump]), "resin")
+    tab.add_section("UV Hardening", make_page_container([g_uv]), "uv")
+
+    # ---- 8. Advanced (Extrusion widths & Engine Precision) ----
     g_ew, few = make_card("Extrusion Width")
     tab.add_dspin_rows(few, [
         ("Default extrusion width:", "fff.line_width", f.line_width, 0.20, 2.0, 0.02, 2, "mm"),

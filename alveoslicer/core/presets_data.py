@@ -10,17 +10,17 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-PRESET_CATEGORIES: Tuple[str, ...] = ("print", "filament", "resin", "printer", "hybrid")
+PRESET_CATEGORIES: Tuple[str, ...] = ("print", "filament", "resin", "printer")
 
 CATEGORY_LABELS: Dict[str, str] = {
     "print": "Print Settings",
     "filament": "Filament",
     "resin": "Resin",
     "printer": "Printer",
-    "hybrid": "Hybrid",
 }
 
-# Disjoint mapping of 100% of SlicerConfig fields across the 5 preset categories.
+# Disjoint mapping of 100% of SlicerConfig fields across the 4 preset categories
+# (Print Settings includes both FFF and Hybrid Process / Pump / UV settings).
 # Each entry is ``(section_name_or_None_for_root, attr_name)``.
 CATEGORY_FIELDS: Dict[str, Tuple[Tuple[Optional[str], str], ...]] = {
     "print": (
@@ -87,6 +87,16 @@ CATEGORY_FIELDS: Dict[str, Tuple[Tuple[Optional[str], str], ...]] = {
         ("infill", "flatten_angle_deg"), ("infill", "max_divergence_ratio"),
         ("infill", "smin_blend_radius"), ("infill", "medial_buffer_ratio"),
         ("infill", "shock_cos_threshold"),
+        # Hybrid Process, Resin Pump/Needle & UV Curing (merged into Print Settings)
+        ("hybrid", "enable_resin_pumping"), ("hybrid", "enable_uv_curing"),
+        ("resin", "needle_outer_radius_mm"), ("resin", "needle_safety_clear_mm"),
+        ("resin", "pump_mm3_per_e_mm"), ("resin", "dispense_speed_e_mm_s"),
+        ("resin", "suckback_e_mm"), ("resin", "suckback_speed_e_mm_s"),
+        ("uv", "irradiance_mw_cm2"), ("uv", "beam_width_cm"),
+        ("uv", "target_dose_mj_cm2_per_mm"), ("uv", "min_passes"),
+        ("uv", "inter_pass_cooldown_ms"), ("uv", "focal_z_clearance_mm"),
+        ("uv", "min_scan_speed_mm_s"), ("uv", "max_scan_speed_mm_s"),
+        ("uv", "uv_on_gcode"), ("uv", "uv_off_gcode"),
         # Engine Resolution
         (None, "voxel_pitch_mm"), (None, "slice_raster_pitch_mm"),
         (None, "step_tol_linear"), (None, "step_tol_angular"),
@@ -134,35 +144,31 @@ CATEGORY_FIELDS: Dict[str, Tuple[Tuple[Optional[str], str], ...]] = {
         ("printer", "tool_fff"), ("printer", "tool_resin"),
         ("printer", "tool_uv"), ("printer", "resin_extruder_axis"),
     ),
-    "hybrid": (
-        ("hybrid", "enable_resin_pumping"), ("hybrid", "enable_uv_curing"),
-        ("resin", "needle_outer_radius_mm"), ("resin", "needle_safety_clear_mm"),
-        ("resin", "pump_mm3_per_e_mm"), ("resin", "dispense_speed_e_mm_s"),
-        ("resin", "suckback_e_mm"), ("resin", "suckback_speed_e_mm_s"),
-        ("uv", "irradiance_mw_cm2"), ("uv", "beam_width_cm"),
-        ("uv", "target_dose_mj_cm2_per_mm"), ("uv", "min_passes"),
-        ("uv", "inter_pass_cooldown_ms"), ("uv", "focal_z_clearance_mm"),
-        ("uv", "min_scan_speed_mm_s"), ("uv", "max_scan_speed_mm_s"),
-        ("uv", "uv_on_gcode"), ("uv", "uv_off_gcode"),
-    ),
 }
 
 # Declarative factory presets: category -> list of (name, override_dict)
 BUILTIN_PRESET_SPECS: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {
     "print": [
-        ("0.20mm QUALITY (Hexagonal)", {}),
-        ("0.15mm DETAIL (Hexagonal)", {
+        ("0.20mm QUALITY (Hexagonal Hybrid)", {}),
+        ("0.15mm DETAIL (Hexagonal Hybrid)", {
             "fff.layer_height": 0.15, "fff.first_layer_height": 0.20, "fff.perimeters": 3,
             "fff.bottom_solid_layers": 5, "fff.top_solid_layers": 6, "fff.print_speed_mm_s": 45.0,
             "fff.perimeter_speed_mm_s": 35.0, "fff.external_perimeter_speed_mm_s": 25.0,
             "infill.pattern": "hexagonal", "infill.target_cell_pitch": 8.5, "infill.min_channel_clearance": 1.8,
         }),
-        ("0.25mm DRAFT (Diamond 45°)", {
+        ("0.25mm DRAFT (Diamond 45° Hybrid)", {
             "fff.layer_height": 0.25, "fff.first_layer_height": 0.25, "fff.line_width": 0.50,
             "fff.perimeter_line_width": 0.50, "fff.external_perimeter_line_width": 0.48,
             "fff.print_speed_mm_s": 65.0, "fff.perimeter_speed_mm_s": 55.0,
             "fff.external_perimeter_speed_mm_s": 45.0, "infill.pattern": "diamond",
             "infill.target_cell_pitch": 11.0, "voxel_pitch_mm": 0.60, "slice_raster_pitch_mm": 0.30,
+        }),
+        ("0.20mm THERMAL-SAFE UV (3-Pass Hybrid)", {
+            "hybrid.enable_resin_pumping": True, "hybrid.enable_uv_curing": True,
+            "uv.min_passes": 3, "uv.inter_pass_cooldown_ms": 1800, "uv.target_dose_mj_cm2_per_mm": 95.0,
+        }),
+        ("0.20mm DOSING ONLY (Manual External UV)", {
+            "hybrid.enable_resin_pumping": True, "hybrid.enable_uv_curing": False,
         }),
         ("0.20mm STRUCTURAL (Triangular Iso-Grid)", {
             "fff.perimeters": 3, "fff.brim_type": "outer_only", "fff.brim_width_mm": 5.0,
@@ -190,15 +196,21 @@ BUILTIN_PRESET_SPECS: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {
             "infill.pattern": "cubic", "infill.target_cell_pitch": 10.0,
             "fff.ironing_enable": True, "fff.ironing_spacing_mm": 0.15, "fff.ironing_flow_pct": 15.0,
         }),
-        ("0.20mm STANDARD FFF (Gyroid 15%)", {
+        ("0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)", {
             "infill.infill_engine": "standard", "infill.fill_density_pct": 15.0,
             "infill.standard_fill_pattern": "gyroid", "infill.top_fill_pattern": "monotonic",
             "infill.bottom_fill_pattern": "monotonic",
+            "hybrid.enable_resin_pumping": False, "hybrid.enable_uv_curing": False,
         }),
-        ("0.20mm STANDARD FFF (Grid 20%)", {
+        ("0.20mm STANDARD FFF (Grid 20%, No Resin/UV)", {
             "infill.infill_engine": "standard", "infill.fill_density_pct": 20.0,
             "infill.standard_fill_pattern": "grid", "infill.top_fill_pattern": "monotonic",
             "infill.bottom_fill_pattern": "monotonic",
+            "hybrid.enable_resin_pumping": False, "hybrid.enable_uv_curing": False,
+        }),
+        ("0.20mm CELLULAR FFF ONLY (Hexagonal, No Resin/UV)", {
+            "infill.infill_engine": "surface_normal_3d", "infill.pattern": "hexagonal",
+            "hybrid.enable_resin_pumping": False, "hybrid.enable_uv_curing": False,
         }),
     ],
     "filament": [
@@ -248,19 +260,6 @@ BUILTIN_PRESET_SPECS: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {
             "printer.printer_type": "bedslinger_prototype", "printer.bed_size_x": 250.0,
             "printer.bed_size_y": 210.0, "printer.bed_size_z": 220.0,
             "printer.needle_offset_x": 0.0, "printer.needle_offset_y": 0.0,
-        }),
-    ],
-    "hybrid": [
-        ("Standard Hybrid (Pump + UV)", {}),
-        ("Thermal-Safe Multi-Pass UV (3 Passes)", {
-            "hybrid.enable_resin_pumping": True, "hybrid.enable_uv_curing": True,
-            "uv.min_passes": 3, "uv.inter_pass_cooldown_ms": 1800, "uv.target_dose_mj_cm2_per_mm": 95.0,
-        }),
-        ("Standard FFF Only (No Resin / No UV)", {
-            "hybrid.enable_resin_pumping": False, "hybrid.enable_uv_curing": False,
-        }),
-        ("Dosing Only (Manual External UV)", {
-            "hybrid.enable_resin_pumping": True, "hybrid.enable_uv_curing": False,
         }),
     ],
 }

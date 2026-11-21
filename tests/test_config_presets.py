@@ -75,14 +75,27 @@ class TestPresets(unittest.TestCase):
     def test_builtin_and_user_preset_persistence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             pm = PresetManager(user_dir=Path(tmp))
+            self.assertEqual(PRESET_CATEGORIES, ("print", "filament", "resin", "printer"))
+            self.assertNotIn("hybrid", PRESET_CATEGORIES)
             for cat in PRESET_CATEGORIES:
                 presets = pm.list_presets(cat)
                 self.assertGreaterEqual(len(presets), 3, f"Category '{cat}' should have premade presets")
 
             cfg = SlicerConfig()
-            self.assertTrue(pm.apply_preset(cfg, "hybrid", "Standard FFF Only (No Resin / No UV)"))
+            self.assertTrue(
+                pm.apply_preset(cfg, "print", "0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)")
+            )
             self.assertTrue(cfg.hybrid.is_fff_only)
-            self.assertFalse(pm.is_modified(cfg, "hybrid", "Standard FFF Only (No Resin / No UV)"))
+            self.assertEqual(cfg.infill.infill_engine, "standard")
+            self.assertEqual(cfg.infill.standard_fill_pattern, "gyroid")
+            self.assertFalse(
+                pm.is_modified(cfg, "print", "0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)")
+            )
+            self.assertTrue(
+                pm.apply_preset(cfg, "print", "0.20mm CELLULAR FFF ONLY (Hexagonal, No Resin/UV)")
+            )
+            self.assertTrue(cfg.hybrid.is_fff_only)
+            self.assertEqual(cfg.infill.infill_engine, "surface_normal_3d")
 
             cfg.fff.nozzle_temp_c = 245
             self.assertTrue(pm.is_modified(cfg, "filament", pm.default_preset_name("filament")))

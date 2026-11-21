@@ -17,8 +17,8 @@ from scipy.spatial import cKDTree
 from skimage import measure
 
 from ..core.config import SlicerConfig
-from ..core.geometry import VolumetricField
-from .lattice import Capsule, CellHalfPlane, NormalVoronoiLattice
+from ..core.geometry import VolumetricField, split_mesh_bodies
+from .lattice import Capsule, CellHalfPlane, NormalVoronoiLattice, combine_lattices
 
 # -----------------------------------------------------------------------------
 # Surface Sampling & Regularization Helpers
@@ -778,7 +778,28 @@ def generate_normal_dendritic_infill(
     Stage 3: Build the 3D cellular seed field and precompute exact 3D bisector half-planes
     for Hexagonal (regular equal-side flat-top), Voronoi, Square, Diamond (45-deg),
     Triangular (equilateral iso-grid), Brick, Gyroid (TPMS), or Cubic (54.7-deg tilted 3D).
+
+    When ``field.mesh`` contains multiple disconnected bodies, each body receives its own
+    independent volumetric field and 3D cellular wireframe so no body is skipped or cross-coupled.
     """
+    bodies = split_mesh_bodies(field.mesh)
+    if len(bodies) > 1:
+        sub_lattices = [
+            _generate_single_body_dendritic_infill(VolumetricField(b, pitch=field.pitch), cfg)
+            for b in bodies
+        ]
+        return combine_lattices(
+            sub_lattices,
+            pattern=cfg.infill.pattern,
+            pitch=max(2.5, cfg.infill.target_cell_pitch),
+        )
+    return _generate_single_body_dendritic_infill(field, cfg)
+
+
+def _generate_single_body_dendritic_infill(
+    field: VolumetricField, cfg: SlicerConfig
+) -> NormalVoronoiLattice:
+    """Synthesize the 3D cellular seed field, wireframe, and half-planes for a single connected body."""
     icfg = cfg.infill
     pitch = max(2.5, icfg.target_cell_pitch)
     pattern = icfg.pattern

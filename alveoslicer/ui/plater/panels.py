@@ -323,7 +323,7 @@ def build_right_sidebar(view: "PlaterView") -> QWidget:
 
 
 def _build_presets_card(view: "PlaterView") -> QGroupBox:
-    """Build the 5-category preset selector group box."""
+    """Build the 4-category preset selector group box (Print Settings & Hybrid, Filament, Resin, Printer)."""
     grp = QGroupBox("Presets")
     p_vbox = QVBoxLayout(grp)
     p_vbox.setSpacing(5)
