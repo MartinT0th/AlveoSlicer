@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alveoslicer"
-version = "A0.2.5"
+version = "A0.3.0"
 description = "Hybrid FFF + in-situ UV photopolymerization 3D printer slicer with 3D surface-normal cellular formwork"
 readme = "README.md"
 license = { file = "LICENSE" }

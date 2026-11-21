@@ -7,24 +7,26 @@ import traceback
 import trimesh
 from PySide6.QtCore import QThread, Signal
 
-from ..config import SlicerConfig
+from ..core.config import SlicerConfig
 from ..pipeline import slice_mesh
 
 
 class SliceWorker(QThread):
-    """Runs ``alveoslicer.pipeline.slice_mesh`` on a worker thread and streams progress/logs."""
+    """Runs :func:`alveoslicer.pipeline.slice_mesh` on a worker thread and streams progress/logs."""
 
     progress = Signal(int, str)
     log_msg = Signal(str)
     finished_ok = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, mesh: trimesh.Trimesh, cfg: SlicerConfig):
+    def __init__(self, mesh: trimesh.Trimesh, cfg: SlicerConfig) -> None:
+        """Store an isolated copy of ``mesh`` and the slicing configuration."""
         super().__init__()
         self.mesh = mesh.copy()
         self.cfg = cfg
 
     def run(self) -> None:
+        """Execute the 6-stage slicing pipeline and emit either ``finished_ok`` or ``failed``."""
         try:
             result = slice_mesh(
                 self.mesh,

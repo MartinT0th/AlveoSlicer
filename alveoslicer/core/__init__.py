@@ -1,0 +1,75 @@
+"""Core headless domain package: configuration, presets, geometry helpers, mesh ops, and multi-bed scene."""
+
+from .config import (
+    BED_SHAPES,
+    BRIM_TYPES,
+    CELL_PATTERNS,
+    FILAMENT_TYPES,
+    FUZZY_SKIN_MODES,
+    GCODE_FLAVORS,
+    INFILL_ENGINES,
+    SEAM_POSITIONS,
+    STANDARD_INFILL_PATTERNS,
+    SUPPORT_MODES,
+    SUPPORT_PATTERNS,
+    SUPPORT_STYLES,
+    TOP_BOTTOM_FILL_PATTERNS,
+    FFFSettings,
+    HybridSettings,
+    InfillSettings,
+    PrinterProfile,
+    ResinSettings,
+    SlicerConfig,
+    UVSettings,
+)
+from .geometry import (
+    VolumetricField,
+    center_mesh_on_bed,
+    clean_geom,
+    create_test_curved_wall_mesh,
+    create_test_sphere_mesh,
+    disk_kernel,
+    extract_polylines,
+    iter_polygons,
+    load_and_center_mesh,
+    rasterize_geom,
+    safe_buffer,
+    safe_difference,
+    safe_intersection,
+    safe_union,
+)
+from .mesh_ops import (
+    SimplifiedFace,
+    compute_placeable_faces,
+    cut_mesh_by_plane,
+    normalize_base_mesh,
+    rotation_matrix_aligning_vectors,
+)
+from .presets import (
+    CATEGORY_FIELDS,
+    CATEGORY_LABELS,
+    PRESET_CATEGORIES,
+    Preset,
+    PresetManager,
+    apply_category_values,
+    extract_category_values,
+    field_key,
+)
+from .scene import BuildPlate, ModelInstance, WorkspaceScene
+
+__all__ = [
+    "BED_SHAPES", "BRIM_TYPES", "CELL_PATTERNS", "FILAMENT_TYPES", "FUZZY_SKIN_MODES",
+    "GCODE_FLAVORS", "INFILL_ENGINES", "SEAM_POSITIONS", "STANDARD_INFILL_PATTERNS",
+    "SUPPORT_MODES", "SUPPORT_PATTERNS", "SUPPORT_STYLES", "TOP_BOTTOM_FILL_PATTERNS",
+    "FFFSettings", "HybridSettings", "InfillSettings", "PrinterProfile", "ResinSettings",
+    "SlicerConfig", "UVSettings",
+    "VolumetricField", "center_mesh_on_bed", "clean_geom", "create_test_curved_wall_mesh",
+    "create_test_sphere_mesh", "disk_kernel", "extract_polylines", "iter_polygons",
+    "load_and_center_mesh", "rasterize_geom", "safe_buffer", "safe_difference",
+    "safe_intersection", "safe_union",
+    "SimplifiedFace", "compute_placeable_faces", "cut_mesh_by_plane",
+    "normalize_base_mesh", "rotation_matrix_aligning_vectors",
+    "CATEGORY_FIELDS", "CATEGORY_LABELS", "PRESET_CATEGORIES", "Preset", "PresetManager",
+    "apply_category_values", "extract_category_values", "field_key",
+    "BuildPlate", "ModelInstance", "WorkspaceScene",
+]

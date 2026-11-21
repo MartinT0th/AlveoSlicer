@@ -9,14 +9,14 @@ from typing import Callable, Dict, List, Optional, Union
 import numpy as np
 import trimesh
 
-from .config import SlicerConfig
-from .dosing import DosingPoint, plan_cycle_dosing
-from .geometry import VolumetricField
-from .hal import create_hal
-from .infill import Capsule, generate_normal_dendritic_infill
-from .scheduler import CureCycle, compute_optimal_cure_schedule
+from .core.config import SlicerConfig
+from .core.geometry import VolumetricField
+from .gcode.hal import create_hal
+from .gcode.toolpath import generate_fff_paths_for_layer
+from .hybrid.dosing import DosingPoint, plan_cycle_dosing
+from .hybrid.scheduler import CureCycle, compute_optimal_cure_schedule
+from .infill import Capsule, NormalVoronoiLattice, generate_normal_dendritic_infill
 from .slicing import SlicedLayer, slice_model_to_layers
-from .toolpath import generate_fff_paths_for_layer
 
 ProgressCallback = Callable[[int, str], None]
 LogCallback = Callable[[str], None]
@@ -58,8 +58,6 @@ def slice_mesh(
             on_log(msg)
 
     if str(cfg.infill.infill_engine).lower() == "standard":
-        from .infill import NormalVoronoiLattice
-
         _progress(22, "Stage 2-3: Preparing Standard PrusaSlicer Infill engine...")
         _log(
             f"[Stage 2-3] Using Standard PrusaSlicer Infill engine "
