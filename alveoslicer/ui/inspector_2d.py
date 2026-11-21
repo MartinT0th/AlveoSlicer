@@ -153,8 +153,8 @@ class LayerInspector2D(QWidget):
         img[:, :, :3] = (0.07, 0.075, 0.085)  # Background / empty air cells
 
         img[ly.void_mask.T] = (0.05, 0.55, 0.78, 1.0)         # Continuous photopolymer cavity
-        img[ly.dry_support_mask.T] = (0.72, 0.58, 0.16, 1.0)  # Dry hollow-core support
-        img[ly.infill_mask.T] = (1.0, 0.42, 0.14, 1.0)        # Inside perimeters & cell bridge caps
+        img[ly.dry_support_mask.T] = (0.26, 0.72, 0.40, 1.0)  # Dry hollow-core support
+        img[ly.infill_mask.T] = (0.96, 0.77, 0.09, 1.0)       # Inside perimeters & cell bridge caps (yellow)
         img[ly.shell_mask.T] = (0.86, 0.88, 0.92, 1.0)        # Watertight FFF shells & solid skins
 
         self.ax.clear()
@@ -179,23 +179,24 @@ class LayerInspector2D(QWidget):
                 f"{len(dosing_pts)} needle targets ({tot_mm3:.1f} mm3)"
             )
             self.lbl_layer_info.setStyleSheet(
-                "background-color: #2c1810; color: #ffab91; border: 1px solid #ff5722; "
-                "padding: 6px 10px; border-radius: 4px; font-weight: 600;"
+                "background-color: rgba(0, 212, 255, 0.14); color: #7ee8ff; "
+                "border: 1px solid rgba(0, 212, 255, 0.55); "
+                "padding: 6px 10px; border-radius: 5px; font-weight: 600;"
             )
             if dosing_pts:
                 dx = [p.x for p in dosing_pts]
                 dy = [p.y for p in dosing_pts]
-                self.ax.plot(dx, dy, color="#ff5252", linewidth=0.9, linestyle="--", alpha=0.8)
-                self.ax.scatter(dx, dy, color="#ff1744", edgecolors="#ffffff", s=45, zorder=5)
+                self.ax.plot(dx, dy, color="#00d4ff", linewidth=1.0, linestyle="--", alpha=0.85)
+                self.ax.scatter(dx, dy, color="#f5c518", edgecolors="#141518", s=48, zorder=5)
                 for idx_p, pt in enumerate(dosing_pts[:25]):
                     self.ax.annotate(
                         f"#{idx_p + 1}\n{pt.volume_mm3:.1f}",
                         (pt.x, pt.y),
                         textcoords="offset points",
                         xytext=(5, 5),
-                        color="#ffffff",
+                        color="#f5c518",
                         fontsize=7,
-                        bbox=dict(boxstyle="round,pad=0.15", fc="#16171a", ec="#ff5252", alpha=0.8),
+                        bbox=dict(boxstyle="round,pad=0.15", fc="#16171a", ec="#f5c518", alpha=0.85),
                     )
         else:
             self.lbl_layer_info.setText(
@@ -203,22 +204,22 @@ class LayerInspector2D(QWidget):
                 f"FFF Print Layer (No resin injection on this layer)"
             )
             self.lbl_layer_info.setStyleSheet(
-                "background-color: #111215; color: #e4e6eb; border: 1px solid #2c2f36; "
-                "padding: 6px 10px; border-radius: 4px; font-weight: 600;"
+                "background-color: #131418; color: #eceff4; border: 1px solid #313542; "
+                "padding: 6px 10px; border-radius: 5px; font-weight: 600;"
             )
 
         legend_items = [
             Patch(facecolor=(0.86, 0.88, 0.92), label="Watertight Shell"),
-            Patch(facecolor=(1.0, 0.42, 0.14), label="Inside Perimeters / Caps"),
+            Patch(facecolor=(0.96, 0.77, 0.09), label="Inside Perimeters / Caps"),
             Patch(facecolor=(0.05, 0.55, 0.78), label="Photopolymer Channel"),
-            Patch(facecolor=(0.72, 0.58, 0.16), label="Dry Core Support"),
+            Patch(facecolor=(0.26, 0.72, 0.40), label="Dry Core Support"),
         ]
         self.ax.legend(
             handles=legend_items,
             loc="upper right",
-            facecolor="#16171a",
-            edgecolor="#32363e",
-            labelcolor="#e4e6eb",
+            facecolor="#17181c",
+            edgecolor="#313542",
+            labelcolor="#eceff4",
             fontsize=8,
         )
         self.canvas.draw_idle()

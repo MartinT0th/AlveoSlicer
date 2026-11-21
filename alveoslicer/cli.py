@@ -24,6 +24,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--infill-mode", choices=["hollow_shell", "full_to_medial"])
     parser.add_argument("--pattern", choices=["voronoi", "hexagonal"])
     parser.add_argument("--flatten-angle", type=float, help="Flatten faces tilted < angle (deg) to horizontal")
+    parser.add_argument(
+        "--fff-only",
+        action="store_true",
+        help="Disable resin pumping and UV curing for standard FFF printers",
+    )
     parser.add_argument("--test-sphere", action="store_true", help="Slice a built-in 30 mm sphere")
     parser.add_argument("--test-wall", action="store_true", help="Slice a built-in 60x25x5 mm curved wavy wall")
     return parser
@@ -47,6 +52,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         cfg.infill.pattern = args.pattern
     if args.flatten_angle is not None:
         cfg.infill.flatten_angle_deg = args.flatten_angle
+    if args.fff_only:
+        cfg.hybrid.enable_resin_pumping = False
+        cfg.hybrid.enable_uv_curing = False
 
     if args.test_wall:
         mesh = create_test_curved_wall_mesh(cfg)

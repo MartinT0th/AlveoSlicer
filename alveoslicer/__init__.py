@@ -2,6 +2,7 @@
 
 from .config import (
     FFFSettings,
+    HybridSettings,
     InfillSettings,
     PrinterProfile,
     ResinSettings,
@@ -9,6 +10,7 @@ from .config import (
     UVSettings,
 )
 from .dosing import DosingPoint, order_points_tsp, plan_cycle_dosing
+from .gcode_parser import DosingMarker, GCodePreviewData, parse_gcode
 from .geometry import (
     VolumetricField,
     center_mesh_on_bed,
@@ -30,6 +32,7 @@ from .infill import (
     generate_normal_dendritic_infill,
 )
 from .pipeline import SliceResult, run_slicer, slice_mesh
+from .presets import PRESET_CATEGORIES, Preset, PresetManager
 from .scheduler import CureCycle, compute_optimal_cure_schedule
 from .slicing import SlicedLayer, slice_model_to_layers
 from .toolpath import PRUSA_TYPE_MAP, generate_fff_paths_for_layer
@@ -41,7 +44,12 @@ __all__ = [
     "ResinSettings",
     "UVSettings",
     "PrinterProfile",
+    "HybridSettings",
     "SlicerConfig",
+    # Presets
+    "PRESET_CATEGORIES",
+    "Preset",
+    "PresetManager",
     # Geometry
     "VolumetricField",
     "center_mesh_on_bed",
@@ -64,9 +72,12 @@ __all__ = [
     "DosingPoint",
     "order_points_tsp",
     "plan_cycle_dosing",
-    # Toolpath
+    # Toolpath & G-code Parser
     "PRUSA_TYPE_MAP",
     "generate_fff_paths_for_layer",
+    "DosingMarker",
+    "GCodePreviewData",
+    "parse_gcode",
     # HAL
     "GCodeHAL",
     "BedslingerPrototypeHAL",

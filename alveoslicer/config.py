@@ -121,6 +121,18 @@ class PrinterProfile:
 
 
 @dataclass
+class HybridSettings:
+    """Master switches for hybrid photopolymer pumping and in-situ UV curing."""
+
+    enable_resin_pumping: bool = True
+    enable_uv_curing: bool = True
+
+    @property
+    def is_fff_only(self) -> bool:
+        return (not self.enable_resin_pumping) and (not self.enable_uv_curing)
+
+
+@dataclass
 class SlicerConfig:
     """Top-level JSON-serializable configuration shared by the engine, CLI, and GUI."""
 
@@ -133,6 +145,7 @@ class SlicerConfig:
     resin: ResinSettings = field(default_factory=ResinSettings)
     uv: UVSettings = field(default_factory=UVSettings)
     printer: PrinterProfile = field(default_factory=PrinterProfile)
+    hybrid: HybridSettings = field(default_factory=HybridSettings)
 
     def to_json(self, path: Union[str, Path]) -> None:
         Path(path).write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
@@ -150,4 +163,5 @@ class SlicerConfig:
             resin=_from_dict(ResinSettings, raw.get("resin", {})),
             uv=_from_dict(UVSettings, raw.get("uv", {})),
             printer=_from_dict(PrinterProfile, raw.get("printer", {})),
+            hybrid=_from_dict(HybridSettings, raw.get("hybrid", {})),
         )

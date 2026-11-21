@@ -55,8 +55,8 @@ class CureScheduleView(QWidget):
         self.tbl_schedule.cellClicked.connect(self._on_row_clicked)
         vbox.addWidget(self.tbl_schedule, stretch=1)
 
-        hint = QLabel("Click any row to jump the 2D Layer Inspector directly to that cure layer.")
-        hint.setStyleSheet("color: #9aa0aa;")
+        hint = QLabel("Click any row to jump directly to that cure layer in the Plater G-Code Previewer.")
+        hint.setObjectName("mutedLabel")
         vbox.addWidget(hint)
 
     def populate(self, res: SliceResult) -> None:

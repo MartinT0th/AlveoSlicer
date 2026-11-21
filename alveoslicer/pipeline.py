@@ -37,6 +37,8 @@ class SliceResult:
     gcode_text: str
     total_resin_ml: float
     gcode_line_count: int
+    total_filament_mm: float = 0.0
+    est_print_time_s: float = 0.0
 
 
 def slice_mesh(
@@ -77,17 +79,23 @@ def slice_mesh(
     layers, xs, ys = slice_model_to_layers(mesh, field, lattice, cfg)
     _log(f"          Sliced {len(layers)} exact vector layers.")
 
-    _progress(65, "Stage 4: Solving Global Dynamic Programming cure schedule...")
-    _log(
-        f"[Stage 4] Solving global DP cure schedule "
-        f"(window=[{cfg.resin.x_min_layers}, {cfg.resin.x_max_layers}] layers)..."
-    )
-    schedule = compute_optimal_cure_schedule(layers, cfg)
-    cycle_by_layer = {c.end_layer: c for c in schedule}
-    _log(f"          Scheduled {len(schedule)} inject + UV cure cycles.")
+    if cfg.hybrid.is_fff_only:
+        _progress(65, "Stage 4: Standard FFF mode (resin & UV disabled)...")
+        _log("[Stage 4] Standard FFF-only mode active: skipping photopolymer dosing & UV cure cycles.")
+        schedule: List[CureCycle] = []
+        cycle_by_layer: Dict[int, CureCycle] = {}
+    else:
+        _progress(65, "Stage 4: Solving Global Dynamic Programming cure schedule...")
+        _log(
+            f"[Stage 4] Solving global DP cure schedule "
+            f"(window=[{cfg.resin.x_min_layers}, {cfg.resin.x_max_layers}] layers)..."
+        )
+        schedule = compute_optimal_cure_schedule(layers, cfg)
+        cycle_by_layer = {c.end_layer: c for c in schedule}
+        _log(f"          Scheduled {len(schedule)} inject + UV cure cycles.")
 
-    _progress(75, "Stage 5-6: Generating FFF toolpaths, fluid basins & G-code...")
-    _log("[Stage 5-6] Generating exact vector FFF toolpaths, resin channel dosing & G-code...")
+    _progress(75, "Stage 5-6: Generating FFF toolpaths & G-code...")
+    _log("[Stage 5-6] Generating exact vector FFF toolpaths & G-code...")
     hal = create_hal(cfg)
     hal.start_gcode()
 
@@ -100,12 +108,13 @@ def slice_mesh(
         fff_paths = generate_fff_paths_for_layer(ly, xs, ys, cfg)
         hal.emit_fff_layer(ly.layer_idx, ly.z, fff_paths)
 
-        if ly.layer_idx in cycle_by_layer:
+        if (not cfg.hybrid.is_fff_only) and (ly.layer_idx in cycle_by_layer):
             cycle = cycle_by_layer[ly.layer_idx]
             dosing_pts, bbox_xy = plan_cycle_dosing(layers, cycle, xs, ys, cfg)
             dosing_by_layer[ly.layer_idx] = dosing_pts
-            if dosing_pts:
-                total_resin_mm3 += sum(d.volume_mm3 for d in dosing_pts)
+            if dosing_pts or cfg.hybrid.enable_uv_curing:
+                if cfg.hybrid.enable_resin_pumping:
+                    total_resin_mm3 += sum(d.volume_mm3 for d in dosing_pts)
                 hal.emit_resin_and_uv_cycle(cycle, ly.z, dosing_pts, bbox_xy)
 
         if idx % progress_stride == 0:
@@ -134,6 +143,8 @@ def slice_mesh(
         gcode_text=gcode_text,
         total_resin_ml=total_ml,
         gcode_line_count=len(hal.lines),
+        total_filament_mm=hal.total_e_fff_mm,
+        est_print_time_s=hal.est_time_s,
     )
 
 
