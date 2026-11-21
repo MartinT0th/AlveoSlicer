@@ -1,4 +1,8 @@
-# AlveoSlicer
+<p align="center">
+  <img src="AlveoSlicerLogo.png" alt="AlveoSlicer Logo" width="140" />
+</p>
+
+<h1 align="center">AlveoSlicer</h1>
 
 **AlveoSlicer** is a standalone, modular slicer built from scratch for **hybrid FFF + in-situ UV photopolymerization 3D printing**, while also offering full PrusaSlicer-class FFF slicing and clean single-extruder G-code export for standard FFF printers.
 
@@ -131,13 +135,29 @@ AlveoSlicer strictly enforces a **headless core invariant**: everything outside 
 
 ```text
 AlveoSlicer/
+├── .github/                         # GitHub Issue Forms (bug/feature) & Pull Request template
+├── ACCESSIBILITY.md                 # Accessibility statement, themes, shortcuts & CLI support
+├── CODE_OF_CONDUCT.md               # Contributor Covenant v2.1 community standards
+├── CONTRIBUTING.md                  # Contributor guide, invariants & PR checklist
+├── LICENSE                          # GNU AGPL v3.0 license
+├── SECURITY.md                      # Software & physical printer UV/thermal safety reporting
+├── AlveoSlicerLogo.png              # Project logo artwork
 ├── pyproject.toml                   # Package metadata, optional [ui]/[step]/[all] extras & CLI entry points
 ├── README.md                        # Project overview, architecture & user manual
+├── packaging/                       # Standalone portable executable build scripts
+│   ├── launch_gui.py                #   Frozen PyInstaller GUI entry point
+│   └── build_exe.py                 #   Single-file Windows AlveoSlicer.exe builder
 ├── alveoslicer/
 │   ├── __init__.py                  # Public Python facade (re-exports core config, scene, pipeline, HALs, parser)
 │   ├── __main__.py                  # Enables `python -m alveoslicer`
 │   ├── pipeline.py                  # Unified 6-stage orchestrator (SliceResult, slice_mesh, run_slicer)
 │   ├── cli.py                       # Command-line interface & argument parser
+│   │
+│   ├── assets/                      # Bundled application icons & frozen-safe asset path resolver
+│   │   ├── __init__.py              #   PyInstaller-aware get_app_icon_path() & get_logo_path()
+│   │   ├── alveoslicer.ico          #   Multi-size Windows desktop & taskbar icon
+│   │   ├── alveoslicer_icon.png     #   High-resolution rounded-tile app icon
+│   │   └── AlveoSlicerLogo.png      #   Transparent logo artwork
 │   │
 │   ├── core/                        # Configuration, geometry, mesh operations, scene & presets
 │   │   ├── config.py                #   JSON-serializable dataclasses (FFF, Infill, Resin, UV, Printer, Hybrid, SlicerConfig)
@@ -173,7 +193,7 @@ AlveoSlicer/
 │   └── ui/                          # PySide6 PrusaSlicer-style desktop GUI
 │       ├── __init__.py              #   Exports AlveoSlicerWindow and main()
 │       ├── __main__.py              #   Enables `python -m alveoslicer.ui`
-│       ├── app.py                   #   QApplication bootstrap
+│       ├── app.py                   #   QApplication bootstrap & Windows taskbar AppUserModelID icon setup
 │       ├── main_window.py           #   AlveoSlicerWindow orchestrating tabs, menus, themes, multi-plate & slicing queue
 │       ├── worker.py                #   Background QThread SliceWorker
 │       ├── styling/
@@ -246,6 +266,20 @@ python -m alveoslicer --help
 # (or, after editable install)
 alveoslicer --help
 ```
+
+### Standalone Portable Executable (`AlveoSlicer.exe`)
+
+You can package AlveoSlicer as a single-file Windows executable that embeds Python, PySide6, OpenGL, scientific libraries, and the application icon—no Python installation or repository folder is required at runtime:
+
+```bash
+# Install PyInstaller once inside your virtual environment
+pip install pyinstaller
+
+# Build dist/AlveoSlicer.exe
+python packaging/build_exe.py
+```
+
+Once built, copy or move `dist/AlveoSlicer.exe` anywhere on your PC (such as your **Desktop**, Start Menu folder, or a USB drive) and double-click it to launch AlveoSlicer directly.
 
 ---
 

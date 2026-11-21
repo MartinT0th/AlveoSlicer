@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest a new slicing algorithm, infill pattern, printer HAL, or UI enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make **AlveoSlicer** better? Share your proposal below!
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Motivation
+      description: What problem does this feature solve, or what hybrid/FFF printing workflow would it improve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Solution
+      description: Describe how you envision this working in the GUI, CLI, or slicing pipeline.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Category
+      options:
+        - 3D Surface-Normal / Standard Infill
+        - Hybrid Resin Dosing & UV Curing
+        - Supports / Adhesion / FFF Features
+        - Printer HAL / Firmware Support
+        - 3D Plater / G-Code Previewer UI
+        - Presets / CLI / Packaging
+        - Documentation / Accessibility
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered & Additional Context
+      description: Any workarounds, reference slicers, or mockups/screenshots.

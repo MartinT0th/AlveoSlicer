@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security & Hardware Safety Reports
+    url: https://github.com/MartinT0th/AlveoSlicer/security
+    about: Privately report security vulnerabilities or critical UV/thermal hardware safety interlock issues.

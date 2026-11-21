@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import trimesh
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..assets import get_app_icon_path
 from ..core.config import SlicerConfig
 from ..core.geometry import (
     create_test_curved_wall_mesh,
@@ -67,6 +68,9 @@ class AlveoSlicerWindow(QMainWindow):
         """Initialize scene, config, presets, tabs, menus, theme, and default test wall."""
         super().__init__()
         self.setWindowTitle("AlveoSlicer — Hybrid FFF + Photopolymer Slicer")
+        icon_path = get_app_icon_path()
+        if icon_path is not None:
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1540, 950)
 
         self.preset_manager = preset_manager or PresetManager()

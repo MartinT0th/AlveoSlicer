@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alveoslicer"
-version = "A0.3.0"
+version = "A0.4.0"
 description = "Hybrid FFF + in-situ UV photopolymerization 3D printer slicer with 3D surface-normal cellular formwork"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -37,3 +37,6 @@ alveoslicer-gui = "alveoslicer.ui:main"
 
 [tool.setuptools.packages.find]
 include = ["alveoslicer*"]
+
+[tool.setuptools.package-data]
+"alveoslicer.assets" = ["*.ico", "*.png"]

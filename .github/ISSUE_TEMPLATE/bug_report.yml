@@ -1,0 +1,73 @@
+name: Bug Report
+description: Report a slicing bug, G-code issue, or GUI crash in AlveoSlicer
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please fill out the details below so we can reproduce and fix it quickly.
+        > **Hardware / Security Safety Note:** If this issue involves a critical UV/thermal safety interlock failure or security vulnerability, please report it privately via the Security tab instead (see `SECURITY.md`).
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Area
+      options:
+        - Desktop GUI / 3D Viewport / G-Code Preview
+        - Slicing Engine / Infill (3D Surface-Normal or Standard)
+        - Supports / Brim / Skirt / Wipe Tower
+        - Hybrid Resin Dosing / DP UV Cure Scheduler
+        - G-Code Export / Printer HAL (Bedslinger / CoreXY)
+        - CLI / Configuration / Presets
+        - Standalone Executable (AlveoSlicer.exe)
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps, CLI flags, or GUI actions that trigger the issue.
+      placeholder: |
+        1. Load model ...
+        2. Select preset / change setting ...
+        3. Click Slice Plate ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What you expected to happen instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version (or standalone exe), GPU driver, and AlveoSlicer version.
+      placeholder: |
+        - OS: Windows 11 / Ubuntu 24.04 / macOS 15
+        - Install method: Source (Python 3.12) / AlveoSlicer.exe
+        - AlveoSlicer version / commit: A0.2.5
+        - Printer profile: bedslinger_prototype / corexy_toolchanger / Standard FFF Only
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs, Screenshots, or Config JSON
+      description: Paste any traceback from the Schedule & Log tab, CLI output, or exported config JSON.
+      render: text
