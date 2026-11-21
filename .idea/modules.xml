@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/AlveoSlicer.iml" filepath="$PROJECT_DIR$/.idea/AlveoSlicer.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/alveoslicer.iml" filepath="$PROJECT_DIR$/.idea/alveoslicer.iml" />
     </modules>
   </component>
 </project>

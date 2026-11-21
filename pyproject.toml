@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alveoslicer"
+version = "0.1.0"
+description = "Hybrid FFF + in-situ UV photopolymerization 3D printer slicer with 3D surface-normal cellular formwork"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "trimesh>=4.0",
+    "shapely>=2.0",
+    "scikit-image>=0.22",
+]
+
+[project.optional-dependencies]
+ui = [
+    "PySide6>=6.6",
+    "matplotlib>=3.8",
+]
+step = [
+    "cascadio>=0.0.15",
+]
+all = [
+    "PySide6>=6.6",
+    "matplotlib>=3.8",
+    "cascadio>=0.0.15",
+]
+
+[project.scripts]
+alveoslicer = "alveoslicer.cli:main"
+alveoslicer-gui = "alveoslicer.ui:main"
+
+[tool.setuptools.packages.find]
+include = ["alveoslicer*"]
