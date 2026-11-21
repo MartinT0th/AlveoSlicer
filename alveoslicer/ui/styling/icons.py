@@ -121,6 +121,12 @@ def make_icon(
     elif name == "clone":
         p.drawRoundedRect(QRectF(4.0, 8.0, 10.5, 11.5), 1.8, 1.8)
         p.setPen(pen_ac); p.drawRoundedRect(QRectF(9.5, 4.5, 10.5, 11.5), 1.8, 1.8)
+    elif name == "move_plate":
+        p.drawRoundedRect(QRectF(3.5, 6.0, 8.0, 12.0), 1.6, 1.6)
+        p.drawRoundedRect(QRectF(14.0, 6.0, 6.5, 12.0), 1.6, 1.6)
+        p.setPen(pen_ac)
+        p.drawLine(QPointF(8.5, 12.0), QPointF(16.8, 12.0))
+        _arrow(QPointF(17.0, 12.0), 1, 0, 3.0)
     elif name == "arrange":
         for rx, ry in ((4.0, 4.0), (13.2, 4.0), (4.0, 13.2), (13.2, 13.2)):
             p.drawRoundedRect(QRectF(rx, ry, 6.8, 6.8), 1.5, 1.5)

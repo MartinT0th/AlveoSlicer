@@ -63,6 +63,11 @@ def build_resin_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     tab = CategorySettingsTab("resin", preset_manager)
     r = cfg.resin
 
+    g_mat, fm = make_card("Resin Properties")
+    tab.add_dspin_rows(fm, [
+        ("Density:", "resin.resin_density_g_cm3", r.resin_density_g_cm3, 0.50, 4.00, 0.02, 2, "g/cm³"),
+    ])
+
     g_phys, fp = make_card("Beer-Lambert Curing && Meniscus")
     tab.add_dspin_rows(fp, [
         ("Max cure depth (C_d):", "resin.max_cure_depth_mm", r.max_cure_depth_mm, 0.2, 10.0, 0.1, 2, "mm"),
@@ -70,7 +75,7 @@ def build_resin_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         ("Meniscus headspace:", "resin.headspace_margin_mm", r.headspace_margin_mm, 0.0, 1.0, 0.05, 2, "mm"),
         ("Shrinkage compensation:", "resin.shrinkage_factor", r.shrinkage_factor, 0.90, 1.25, 0.01, 3, ""),
     ])
-    tab.add_section("Curing & Exposure", make_page_container([g_phys]), "uv")
+    tab.add_section("Curing & Exposure", make_page_container([g_mat, g_phys]), "uv")
 
     g_fluid, ff = make_card("Viscosity && Channel Flow")
     ff.addRow("Max basin flow radius:", tab.bind_dspin("resin.max_flow_radius_mm", r.max_flow_radius_mm, 2.0, 50.0, 1.0, 1, "mm"))

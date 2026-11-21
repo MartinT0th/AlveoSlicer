@@ -10,9 +10,50 @@ imports so GUI startup displays the splash screen immediately.
 from __future__ import annotations
 
 import importlib
+import importlib.metadata
+from pathlib import Path
+import re
+import sys
 from typing import Any, Dict, Tuple
 
-from ._version import __version__
+
+def _load_version() -> str:
+    """Resolve the AlveoSlicer version directly from ``pyproject.toml`` (single source of truth).
+
+    Checks the frozen PyInstaller bundle directory (``sys._MEIPASS``) and the repository
+    root first, then falls back to installed package metadata when running from a wheel.
+    """
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / "pyproject.toml")
+    candidates.append(Path(__file__).resolve().parent.parent / "pyproject.toml")
+
+    for toml_path in candidates:
+        if not toml_path.is_file():
+            continue
+        try:
+            import tomllib  # Python 3.11+
+
+            with toml_path.open("rb") as fh:
+                ver = tomllib.load(fh).get("project", {}).get("version")
+            if isinstance(ver, str) and ver.strip():
+                return ver.strip()
+        except ModuleNotFoundError:
+            text = toml_path.read_text(encoding="utf-8")
+            m = re.search(r'(?ms)^\[project\].*?^version\s*=\s*["\']([^"\']+)["\']', text)
+            if m:
+                return m.group(1).strip()
+        except Exception:
+            pass
+
+    try:
+        return importlib.metadata.version("alveoslicer")
+    except importlib.metadata.PackageNotFoundError:
+        return "0.0.0"
+
+
+__version__: str = _load_version()
 
 _LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     # Config

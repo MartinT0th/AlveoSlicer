@@ -8,16 +8,15 @@ synchronization and user interactions.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Dict, Tuple
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFormLayout,
     QFrame,
     QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -37,9 +36,18 @@ if TYPE_CHECKING:
 
 
 COMPACT_SPIN_QSS = (
-    "QDoubleSpinBox { padding: 3px 6px; min-height: 16px; } "
+    "QDoubleSpinBox { padding: 2px 5px; min-height: 16px; } "
     "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { width: 0px; border: none; }"
 )
+
+COMPACT_COMBO_QSS = "QComboBox { padding: 2px 6px; min-height: 16px; }"
+
+_SHORT_CAT_LABELS: Dict[str, str] = {
+    "print": "Print",
+    "filament": "Filament",
+    "resin": "Resin",
+    "printer": "Printer",
+}
 
 
 def rgb_hex(rgb: Tuple[float, float, float]) -> str:
@@ -60,6 +68,18 @@ def format_duration(seconds: float) -> str:
     if mins > 0:
         return f"{mins}m {secs:02d}s"
     return f"{secs}s"
+
+
+def filament_mm_to_grams(length_mm: float, diameter_mm: float, density_g_cm3: float) -> float:
+    """Convert extruded filament length (mm) to mass (g) from diameter and material density."""
+    radius_mm = max(0.1, float(diameter_mm)) * 0.5
+    vol_cm3 = (math.pi * radius_mm * radius_mm * max(0.0, float(length_mm))) / 1000.0
+    return vol_cm3 * max(0.0, float(density_g_cm3))
+
+
+def resin_ml_to_grams(volume_ml: float, density_g_cm3: float) -> float:
+    """Convert liquid photopolymer volume (mL == cm^3) to mass (g) from resin density."""
+    return max(0.0, float(volume_ml)) * max(0.0, float(density_g_cm3))
 
 
 def build_cut_popover(view: "PlaterView") -> QFrame:
@@ -295,6 +315,24 @@ def build_legend_card(view: "PlaterView") -> QFrame:
     return card
 
 
+def _make_sidebar_card(title: str) -> Tuple[QFrame, QVBoxLayout, QHBoxLayout]:
+    """Create a sleek flat sidebar card with a compact header bar and body layout."""
+    card = QFrame()
+    card.setObjectName("sidebarCard")
+    vbox = QVBoxLayout(card)
+    vbox.setContentsMargins(10, 7, 10, 8)
+    vbox.setSpacing(5)
+
+    hdr = QHBoxLayout()
+    hdr.setContentsMargins(0, 0, 0, 0)
+    hdr.setSpacing(5)
+    lbl = QLabel(title.upper())
+    lbl.setObjectName("cardHeader")
+    hdr.addWidget(lbl)
+    vbox.addLayout(hdr)
+    return card, vbox, hdr
+
+
 def build_right_sidebar(view: "PlaterView") -> QWidget:
     """Build the scrollable right-hand sidebar (Presets, Objects, Transform, Summary) and footer."""
     panel = QWidget()
@@ -302,12 +340,12 @@ def build_right_sidebar(view: "PlaterView") -> QWidget:
     panel.setMaximumWidth(500)
     root = QVBoxLayout(panel)
     root.setContentsMargins(4, 0, 0, 0)
-    root.setSpacing(8)
+    root.setSpacing(6)
 
     cards_holder = QWidget()
     cards_v = QVBoxLayout(cards_holder)
-    cards_v.setContentsMargins(0, 0, 6, 0)
-    cards_v.setSpacing(8)
+    cards_v.setContentsMargins(0, 0, 4, 0)
+    cards_v.setSpacing(6)
 
     cards_v.addWidget(_build_presets_card(view))
     cards_v.addWidget(_build_objects_card(view))
@@ -322,107 +360,180 @@ def build_right_sidebar(view: "PlaterView") -> QWidget:
     return panel
 
 
-def _build_presets_card(view: "PlaterView") -> QGroupBox:
-    """Build the 4-category preset selector group box (Print Settings & Hybrid, Filament, Resin, Printer)."""
-    grp = QGroupBox("Presets")
-    p_vbox = QVBoxLayout(grp)
-    p_vbox.setSpacing(5)
+def _build_presets_card(view: "PlaterView") -> QFrame:
+    """Build the compact 4-category preset grid (Print, Filament, Resin, Printer)."""
+    card, p_vbox, hdr = _make_sidebar_card("Presets")
+    hdr.addStretch(1)
+
+    grid = QGridLayout()
+    grid.setContentsMargins(0, 0, 0, 0)
+    grid.setHorizontalSpacing(6)
+    grid.setVerticalSpacing(4)
 
     view._preset_combos = {}
     view._preset_mod_labels = {}
 
-    for cat in PRESET_CATEGORIES:
-        hdr = QHBoxLayout()
-        hdr.setSpacing(4)
-        lbl = QLabel(f"{CATEGORY_LABELS[cat]}:")
-        lbl.setStyleSheet("font-weight: 600; font-size: 11px;")
-        mod_lbl = QLabel("* modified")
-        mod_lbl.setObjectName("accentValue")
-        mod_lbl.setVisible(False)
-        hdr.addWidget(lbl)
-        hdr.addStretch(1)
-        hdr.addWidget(mod_lbl)
-        p_vbox.addLayout(hdr)
+    for r_idx, cat in enumerate(PRESET_CATEGORIES):
+        lbl_wrap = QWidget()
+        lbl_wrap.setObjectName("cardInner")
+        lbl_wrap.setFixedWidth(58)
+        lw_row = QHBoxLayout(lbl_wrap)
+        lw_row.setContentsMargins(0, 0, 0, 0)
+        lw_row.setSpacing(3)
 
-        row = QHBoxLayout()
-        row.setSpacing(5)
+        lbl = QLabel(_SHORT_CAT_LABELS.get(cat, CATEGORY_LABELS[cat]))
+        lbl.setObjectName("mutedLabel")
+        lbl.setStyleSheet("font-weight: 600;")
+        lbl.setToolTip(CATEGORY_LABELS[cat])
+
+        mod_lbl = QLabel("●")
+        mod_lbl.setObjectName("accentValue")
+        mod_lbl.setToolTip(f"{CATEGORY_LABELS[cat]} modified from preset")
+        mod_lbl.setVisible(False)
+
+        lw_row.addWidget(lbl)
+        lw_row.addWidget(mod_lbl)
+        lw_row.addStretch(1)
+
         cb = QComboBox()
+        cb.setStyleSheet(COMPACT_COMBO_QSS)
         cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         cb.setMinimumContentsLength(10)
         cb.currentIndexChanged.connect(lambda idx, c=cat: view._on_sidebar_preset_changed(c, idx))
 
         btn_edit = QPushButton()
-        btn_edit.setObjectName("iconSmallBtn")
-        btn_edit.setFixedSize(30, 28)
+        btn_edit.setObjectName("cardIconBtn")
+        btn_edit.setFixedSize(24, 24)
         btn_edit.setToolTip(f"Open {CATEGORY_LABELS[cat]} tab")
-        view._register_icon_btn(btn_edit, "settings", size=15)
+        view._register_icon_btn(btn_edit, "settings", size=14)
         btn_edit.clicked.connect(lambda _checked=False, c=cat: view.open_settings_requested.emit(c))
 
-        row.addWidget(cb, stretch=1)
-        row.addWidget(btn_edit)
-        p_vbox.addLayout(row)
+        grid.addWidget(lbl_wrap, r_idx, 0)
+        grid.addWidget(cb, r_idx, 1)
+        grid.addWidget(btn_edit, r_idx, 2)
 
         view._preset_combos[cat] = cb
         view._preset_mod_labels[cat] = mod_lbl
-    return grp
+
+    grid.setColumnStretch(1, 1)
+    p_vbox.addLayout(grid)
+    return card
 
 
-def _build_objects_card(view: "PlaterView") -> QGroupBox:
-    """Build the active plate object list and Clone / Move / Remove buttons."""
-    grp = QGroupBox("Build Plate Objects")
-    l_vbox = QVBoxLayout(grp)
-    l_vbox.setSpacing(6)
+def _build_objects_card(view: "PlaterView") -> QFrame:
+    """Build the streamlined Build Plate Objects card with inline icon toolbar and compact rows."""
+    card, l_vbox, hdr = _make_sidebar_card("Build Plate Objects")
 
-    view.list_objects = QListWidget()
-    view.list_objects.setObjectName("objectList")
-    view.list_objects.setFixedHeight(68)
-    view.list_objects.currentItemChanged.connect(view._on_object_list_changed)
-    l_vbox.addWidget(view.list_objects)
+    view.lbl_obj_count = QLabel("0")
+    view.lbl_obj_count.setObjectName("countPill")
+    view.lbl_obj_count.setFixedHeight(18)
+    view.lbl_obj_count.setMinimumWidth(20)
+    view.lbl_obj_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    hdr.addWidget(view.lbl_obj_count)
+    hdr.addStretch(1)
 
-    obj_btns = QHBoxLayout()
-    obj_btns.setSpacing(5)
-    view.btn_dup_inst = QPushButton("Clone")
-    view.btn_dup_inst.setObjectName("iconSmallBtn")
-    view.btn_dup_inst.setToolTip("Clone selected object on this build plate")
+    view.btn_add_obj = QPushButton()
+    view.btn_add_obj.setObjectName("cardIconBtn")
+    view.btn_add_obj.setFixedSize(24, 24)
+    view.btn_add_obj.setToolTip("Add 3D model to active build plate (Ctrl+O)")
+    view._register_icon_btn(view.btn_add_obj, "add_model", size=15)
+    view.btn_add_obj.clicked.connect(view.add_model_requested.emit)
+
+    view.btn_dup_inst = QPushButton()
+    view.btn_dup_inst.setObjectName("cardIconBtn")
+    view.btn_dup_inst.setFixedSize(24, 24)
+    view.btn_dup_inst.setToolTip("Clone selected object (Ctrl+D)")
     view._register_icon_btn(view.btn_dup_inst, "clone", size=14)
     view.btn_dup_inst.clicked.connect(view.duplicate_instance_requested.emit)
 
-    view.btn_move_plate = QPushButton("To Plate...")
-    view.btn_move_plate.setObjectName("iconSmallBtn")
+    view.btn_move_plate = QPushButton()
+    view.btn_move_plate.setObjectName("cardIconBtn")
+    view.btn_move_plate.setFixedSize(24, 24)
     view.btn_move_plate.setToolTip("Move selected object to another build plate")
+    view._register_icon_btn(view.btn_move_plate, "move_plate", size=15)
     view.btn_move_plate.clicked.connect(view.move_to_plate_requested.emit)
 
-    view.btn_del_inst = QPushButton("Remove")
-    view.btn_del_inst.setObjectName("iconSmallBtn")
-    view.btn_del_inst.setToolTip("Delete selected object")
+    view.btn_del_inst = QPushButton()
+    view.btn_del_inst.setObjectName("cardIconBtn")
+    view.btn_del_inst.setFixedSize(24, 24)
+    view.btn_del_inst.setToolTip("Remove selected object (Del)")
     view._register_icon_btn(view.btn_del_inst, "delete", size=14)
     view.btn_del_inst.clicked.connect(view.remove_instance_requested.emit)
 
-    obj_btns.addWidget(view.btn_dup_inst)
-    obj_btns.addWidget(view.btn_move_plate)
-    obj_btns.addWidget(view.btn_del_inst)
-    l_vbox.addLayout(obj_btns)
-    return grp
+    for b in (view.btn_add_obj, view.btn_dup_inst, view.btn_move_plate, view.btn_del_inst):
+        hdr.addWidget(b)
+
+    view.list_objects = QListWidget()
+    view.list_objects.setObjectName("objectList")
+    view.list_objects.setResizeMode(QListWidget.ResizeMode.Adjust)
+    view.list_objects.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+    view.list_objects.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    view.list_objects.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    view.list_objects.customContextMenuRequested.connect(view._show_object_context_menu)
+    view.list_objects.currentItemChanged.connect(view._on_object_list_changed)
+    view.list_objects.setFixedHeight(36)
+    l_vbox.addWidget(view.list_objects)
+
+    view.lbl_objects_empty = QLabel("No models on this plate — click + to import.")
+    view.lbl_objects_empty.setObjectName("mutedLabel")
+    view.lbl_objects_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    view.lbl_objects_empty.setStyleSheet("padding: 4px 0;")
+    view.lbl_objects_empty.setVisible(False)
+    l_vbox.addWidget(view.lbl_objects_empty)
+    return card
 
 
-def _build_transform_card(view: "PlaterView") -> QGroupBox:
-    """Build the Object Manipulation card with Pos/Rot/Scale spinboxes and quick actions."""
-    grp = QGroupBox("Object Manipulation")
-    o_vbox = QVBoxLayout(grp)
-    o_vbox.setSpacing(5)
+def _build_transform_card(view: "PlaterView") -> QFrame:
+    """Build the Object Manipulation card with collapsible empty state and RGB axis grid."""
+    card, o_vbox, hdr = _make_sidebar_card("Object Manipulation")
+    hdr.addStretch(1)
 
+    view.btn_place_face_quick = QPushButton()
+    view.btn_place_face_quick.setObjectName("cardIconBtn")
+    view.btn_place_face_quick.setCheckable(True)
+    view.btn_place_face_quick.setFixedSize(24, 24)
+    view.btn_place_face_quick.setToolTip("Place on Face (F) — click any highlighted face to lay flat")
+    view._register_icon_btn(view.btn_place_face_quick, "place_on_face", size=15)
+    view.btn_place_face_quick.clicked.connect(lambda: view._toggle_edit_tool("place_on_face"))
+
+    view.btn_reset_xform = QPushButton()
+    view.btn_reset_xform.setObjectName("cardIconBtn")
+    view.btn_reset_xform.setFixedSize(24, 24)
+    view.btn_reset_xform.setToolTip("Reset position, rotation, and scale")
+    view._register_icon_btn(view.btn_reset_xform, "revert", size=14)
+    view.btn_reset_xform.clicked.connect(view.reset_transform_requested.emit)
+
+    hdr.addWidget(view.btn_place_face_quick)
+    hdr.addWidget(view.btn_reset_xform)
+
+    view._transform_empty_lbl = QLabel("Click an object on the plate to move, rotate, or scale.")
+    view._transform_empty_lbl.setObjectName("mutedLabel")
+    view._transform_empty_lbl.setWordWrap(True)
+    o_vbox.addWidget(view._transform_empty_lbl)
+
+    view._transform_body = QWidget()
+    view._transform_body.setObjectName("cardInner")
+    body_v = QVBoxLayout(view._transform_body)
+    body_v.setContentsMargins(0, 0, 0, 0)
+    body_v.setSpacing(4)
+
+    meta_row = QHBoxLayout()
+    meta_row.setContentsMargins(0, 0, 0, 0)
+    meta_row.setSpacing(6)
     view.lbl_model_name = QLabel("No object selected")
-    view.lbl_model_name.setStyleSheet("font-weight: 700;")
-    view.lbl_model_name.setWordWrap(True)
-    o_vbox.addWidget(view.lbl_model_name)
-
-    view.lbl_model_dims = QLabel("Size: —   |   Faces: —")
+    view.lbl_model_name.setStyleSheet("font-weight: 700; font-size: 11px;")
+    view.lbl_model_dims = QLabel("—")
     view.lbl_model_dims.setObjectName("mutedLabel")
-    o_vbox.addWidget(view.lbl_model_dims)
+    view.lbl_model_dims.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    meta_row.addWidget(view.lbl_model_name)
+    meta_row.addStretch(1)
+    meta_row.addWidget(view.lbl_model_dims)
+    body_v.addLayout(meta_row)
 
     grid = QGridLayout()
+    grid.setContentsMargins(0, 0, 0, 0)
     grid.setHorizontalSpacing(4)
-    grid.setVerticalSpacing(4)
+    grid.setVerticalSpacing(3)
 
     view.sp_pos_x = make_double_spin(110.0, -200.0, 1000.0, 1.0, 1, "")
     view.sp_pos_y = make_double_spin(110.0, -200.0, 1000.0, 1.0, 1, "")
@@ -434,7 +545,8 @@ def _build_transform_card(view: "PlaterView") -> QGroupBox:
     view.sp_scale_y = make_double_spin(100.0, 5.0, 2000.0, 5.0, 1, "")
     view.sp_scale_z = make_double_spin(100.0, 5.0, 2000.0, 5.0, 1, "")
 
-    view.chk_uniform_scale = QCheckBox("Lock uniform scale")
+    view.chk_uniform_scale = QCheckBox("Uniform")
+    view.chk_uniform_scale.setToolTip("Lock proportional X / Y / Z scaling")
     view.chk_uniform_scale.setChecked(True)
     view.chk_uniform_scale.toggled.connect(view._on_uniform_toggled)
 
@@ -445,7 +557,7 @@ def _build_transform_card(view: "PlaterView") -> QGroupBox:
     )
     for w in all_spins:
         w.setStyleSheet(COMPACT_SPIN_QSS)
-        w.setMinimumWidth(62)
+        w.setMinimumWidth(58)
 
     for w in all_spins[:6]:
         w.valueChanged.connect(view._on_transform_edited)
@@ -454,10 +566,12 @@ def _build_transform_card(view: "PlaterView") -> QGroupBox:
     view.sp_scale_y.valueChanged.connect(lambda v: view._on_scale_axis_edited("y", v))
     view.sp_scale_z.valueChanged.connect(lambda v: view._on_scale_axis_edited("z", v))
 
-    for col_i, axis_lbl in enumerate(("X", "Y", "Z"), start=1):
+    for col_i, (axis_lbl, axis_col) in enumerate(
+        (("X", "#e85d5d"), ("Y", "#4cc374"), ("Z", "#5b9bff")), start=1
+    ):
         lh = QLabel(axis_lbl)
-        lh.setObjectName("mutedLabel")
         lh.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lh.setStyleSheet(f"color: {axis_col}; font-size: 10px; font-weight: 700;")
         grid.addWidget(lh, 0, col_i)
 
     rows = (
@@ -466,73 +580,140 @@ def _build_transform_card(view: "PlaterView") -> QGroupBox:
         ("Scale (%)", view.sp_scale_x, view.sp_scale_y, view.sp_scale_z),
     )
     for r_idx, (r_lbl, wx, wy, wz) in enumerate(rows, start=1):
-        grid.addWidget(QLabel(r_lbl), r_idx, 0)
+        rl = QLabel(r_lbl)
+        rl.setObjectName("mutedLabel")
+        grid.addWidget(rl, r_idx, 0)
         grid.addWidget(wx, r_idx, 1)
         grid.addWidget(wy, r_idx, 2)
         grid.addWidget(wz, r_idx, 3)
 
     for c in (1, 2, 3):
         grid.setColumnStretch(c, 1)
-    o_vbox.addLayout(grid)
-    o_vbox.addWidget(view.chk_uniform_scale)
+    body_v.addLayout(grid)
 
     q_row = QHBoxLayout()
+    q_row.setContentsMargins(0, 2, 0, 0)
     q_row.setSpacing(4)
-    view.btn_rot_x90 = QPushButton("X +90°")
-    view.btn_rot_y90 = QPushButton("Y +90°")
-    view.btn_rot_z90 = QPushButton("Z +90°")
-    view.btn_place_face_quick = QPushButton("Place Face")
-    view.btn_place_face_quick.setCheckable(True)
-    for b in (view.btn_rot_x90, view.btn_rot_y90, view.btn_rot_z90, view.btn_place_face_quick):
-        b.setObjectName("iconSmallBtn")
+    q_row.addWidget(view.chk_uniform_scale)
+    q_row.addStretch(1)
+
+    view.btn_rot_x90 = QPushButton("X+90°")
+    view.btn_rot_y90 = QPushButton("Y+90°")
+    view.btn_rot_z90 = QPushButton("Z+90°")
+    for b in (view.btn_rot_x90, view.btn_rot_y90, view.btn_rot_z90):
+        b.setObjectName("miniChipBtn")
+        b.setToolTip(f"Rotate selected object {b.text()}")
         q_row.addWidget(b)
     view.btn_rot_x90.clicked.connect(lambda: view.quick_rotate_requested.emit("x", 90.0))
     view.btn_rot_y90.clicked.connect(lambda: view.quick_rotate_requested.emit("y", 90.0))
     view.btn_rot_z90.clicked.connect(lambda: view.quick_rotate_requested.emit("z", 90.0))
-    view.btn_place_face_quick.clicked.connect(lambda: view._toggle_edit_tool("place_on_face"))
-    o_vbox.addLayout(q_row)
+    body_v.addLayout(q_row)
 
-    view.btn_reset_xform = QPushButton("Reset Transform")
-    view._register_icon_btn(view.btn_reset_xform, "revert", size=14)
-    view.btn_reset_xform.clicked.connect(view.reset_transform_requested.emit)
-    o_vbox.addWidget(view.btn_reset_xform)
-    return grp
+    o_vbox.addWidget(view._transform_body)
+    return card
 
 
-def _build_summary_card(view: "PlaterView") -> QGroupBox:
-    """Build the Slice Summary readout card (mode badge, layer/cure/material stats)."""
-    grp = QGroupBox("Slice Summary")
-    s_vbox = QVBoxLayout(grp)
-    s_vbox.setSpacing(6)
+def _build_summary_card(view: "PlaterView") -> QFrame:
+    """Build the compact Slice Summary card with 2x2 stat tiles and live m/g & mL/g unit toggles."""
+    card, s_vbox, hdr = _make_sidebar_card("Slice Summary")
+    hdr.addStretch(1)
 
-    view.lbl_mode_badge = QLabel("HYBRID: FFF + RESIN + UV")
+    view.lbl_mode_badge = QLabel("HYBRID")
     view.lbl_mode_badge.setObjectName("modeBannerHybrid")
     view.lbl_mode_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-    s_vbox.addWidget(view.lbl_mode_badge)
+    hdr.addWidget(view.lbl_mode_badge)
 
-    s_form = QFormLayout()
-    s_form.setHorizontalSpacing(10)
-    s_form.setVerticalSpacing(4)
-    view.lbl_stat_layers = QLabel("—")
-    view.lbl_stat_cycles = QLabel("—")
-    view.lbl_stat_filament = QLabel("—")
-    view.lbl_stat_resin = QLabel("—")
-    view.lbl_stat_time = QLabel("—")
-    view.lbl_stat_lines = QLabel("—")
+    # 2x2 compact single-line stat tiles
+    tiles_grid = QGridLayout()
+    tiles_grid.setContentsMargins(0, 0, 0, 0)
+    tiles_grid.setHorizontalSpacing(5)
+    tiles_grid.setVerticalSpacing(4)
 
-    stat_rows = (
-        ("Layers:", view.lbl_stat_layers),
-        ("UV Cure Cycles:", view.lbl_stat_cycles),
-        ("Filament:", view.lbl_stat_filament),
-        ("Photopolymer:", view.lbl_stat_resin),
-        ("Est. Print Time:", view.lbl_stat_time),
-        ("G-Code Lines:", view.lbl_stat_lines),
+    def _make_tile(label_txt: str) -> Tuple[QFrame, QLabel]:
+        tile = QFrame()
+        tile.setObjectName("statTile")
+        th = QHBoxLayout(tile)
+        th.setContentsMargins(8, 5, 8, 5)
+        th.setSpacing(6)
+        lt = QLabel(label_txt)
+        lt.setObjectName("statLabel")
+        lv = QLabel("—")
+        lv.setObjectName("statValue")
+        lv.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        th.addWidget(lt)
+        th.addStretch(1)
+        th.addWidget(lv)
+        return tile, lv
+
+    t_layers, view.lbl_stat_layers = _make_tile("Layers")
+    t_cycles, view.lbl_stat_cycles = _make_tile("UV Cures")
+    t_time, view.lbl_stat_time = _make_tile("Time")
+    t_lines, view.lbl_stat_lines = _make_tile("Lines")
+
+    tiles_grid.addWidget(t_layers, 0, 0)
+    tiles_grid.addWidget(t_cycles, 0, 1)
+    tiles_grid.addWidget(t_time, 1, 0)
+    tiles_grid.addWidget(t_lines, 1, 1)
+    tiles_grid.setColumnStretch(0, 1)
+    tiles_grid.setColumnStretch(1, 1)
+    s_vbox.addLayout(tiles_grid)
+
+    # Material usage rows with inline m/g and mL/g unit toggles
+    def _make_material_row(
+        label_txt: str,
+        unit_a: str,
+        unit_b: str,
+        cb_a,
+        cb_b,
+    ) -> Tuple[QFrame, QLabel, QPushButton, QPushButton]:
+        row_box = QFrame()
+        row_box.setObjectName("statTile")
+        rh = QHBoxLayout(row_box)
+        rh.setContentsMargins(8, 4, 6, 4)
+        rh.setSpacing(5)
+
+        lbl = QLabel(label_txt)
+        lbl.setObjectName("mutedLabel")
+        lbl.setStyleSheet("font-weight: 600;")
+
+        val = QLabel("—")
+        val.setObjectName("statValue")
+        val.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        ba = QPushButton(unit_a)
+        ba.setObjectName("unitToggle")
+        ba.setCheckable(True)
+        ba.setChecked(True)
+        ba.setToolTip(f"Show {label_txt.lower()} in {unit_a}")
+        ba.clicked.connect(cb_a)
+
+        bb = QPushButton(unit_b)
+        bb.setObjectName("unitToggle")
+        bb.setCheckable(True)
+        bb.setChecked(False)
+        bb.setToolTip(f"Show {label_txt.lower()} in {unit_b} (using material density)")
+        bb.clicked.connect(cb_b)
+
+        rh.addWidget(lbl)
+        rh.addStretch(1)
+        rh.addWidget(val)
+        rh.addWidget(ba)
+        rh.addWidget(bb)
+        return row_box, val, ba, bb
+
+    fil_box, view.lbl_stat_filament, view.btn_fil_unit_m, view.btn_fil_unit_g = _make_material_row(
+        "Filament", "m", "g",
+        lambda: view.set_filament_unit("m"),
+        lambda: view.set_filament_unit("g"),
     )
-    for row_lbl, val_lbl in stat_rows:
-        val_lbl.setStyleSheet("font-weight: 600;")
-        s_form.addRow(row_lbl, val_lbl)
-    s_vbox.addLayout(s_form)
-    return grp
+    res_box, view.lbl_stat_resin, view.btn_res_unit_ml, view.btn_res_unit_g = _make_material_row(
+        "Resin", "mL", "g",
+        lambda: view.set_resin_unit("ml"),
+        lambda: view.set_resin_unit("g"),
+    )
+    s_vbox.addWidget(fil_box)
+    s_vbox.addWidget(res_box)
+    return card
 
 
 def _build_action_footer(view: "PlaterView") -> QFrame:

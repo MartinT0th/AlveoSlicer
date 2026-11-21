@@ -379,10 +379,11 @@ class AlveoSlicerWindow(QMainWindow):
         self._sync_bed_and_mode()
 
     def _sync_bed_and_mode(self) -> None:
-        """Sync bed dimensions, hybrid/FFF banner badge, and wipe tower preview to viewport."""
+        """Sync bed dimensions, hybrid/FFF banner badge, material densities, and wipe tower."""
         p = self.cfg.printer
         self.plater.viewport.set_bed_size(p.bed_size_x, p.bed_size_y, p.bed_size_z, bed_shape=p.bed_shape)
         self.plater.update_mode_badge(self.cfg)
+        self.plater.update_material_properties(self.cfg)
         self._sync_wipe_tower_preview()
 
     def _sync_wipe_tower_preview(self) -> None:

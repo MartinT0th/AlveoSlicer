@@ -21,13 +21,30 @@ ICON_PATH = ASSETS_DIR / "alveoslicer.ico"
 LAUNCHER = ROOT / "packaging" / "launch_gui.py"
 
 
+def _render_boot_splash() -> Path:
+    """Render the static bootloader splash PNG matching :class:`AlveoSplashScreen`."""
+    boot_png = ROOT / "build" / "splash_boot.png"
+    script = (
+        "from pathlib import Path; "
+        "from PySide6.QtWidgets import QApplication; "
+        "from alveoslicer.ui.splash import render_boot_splash_png; "
+        f"app = QApplication([]); render_boot_splash_png(Path(r'{boot_png}'))"
+    )
+    subprocess.run([sys.executable, "-c", script], cwd=str(ROOT), check=True)
+    if not boot_png.is_file():
+        raise RuntimeError(f"Failed to render boot splash PNG at {boot_png}")
+    return boot_png
+
+
 def build_executable() -> Path:
     """Invoke PyInstaller to produce a single-file portable GUI executable in ``dist/``."""
     if not ICON_PATH.is_file():
         raise FileNotFoundError(f"Application icon not found at {ICON_PATH}")
 
+    boot_splash = _render_boot_splash()
     sep = ";" if sys.platform == "win32" else ":"
     add_assets = f"{ASSETS_DIR}{sep}alveoslicer/assets"
+    add_pyproject = f"{ROOT / 'pyproject.toml'}{sep}."
 
     cmd = [
         sys.executable,
@@ -41,8 +58,12 @@ def build_executable() -> Path:
         "AlveoSlicer",
         "--icon",
         str(ICON_PATH),
+        "--splash",
+        str(boot_splash),
         "--add-data",
         add_assets,
+        "--add-data",
+        add_pyproject,
         "--paths",
         str(ROOT),
         # Ensure dynamic scientific/Qt backends are always bundled
@@ -57,8 +78,6 @@ def build_executable() -> Path:
         "--hidden-import",
         "skimage.measure._marching_cubes_lewiner",
         # Trim unused large GUI/testing modules to keep binary lean
-        "--exclude-module",
-        "tkinter",
         "--exclude-module",
         "PyQt5",
         "--exclude-module",

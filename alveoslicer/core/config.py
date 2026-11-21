@@ -258,6 +258,7 @@ class ResinSettings:
     cure_depth_safety_eta: float = 0.85             # Safety factor eta in [0.7, 0.9]
     headspace_margin_mm: float = 0.15               # Meniscus recess below top FFF layer (mm)
     shrinkage_factor: float = 1.04                  # Volumetric cure shrinkage multiplier
+    resin_density_g_cm3: float = 1.12               # Liquid photopolymer density (g/cm^3)
     needle_outer_radius_mm: float = 0.45            # Dispensing needle outer radius (mm)
     needle_safety_clear_mm: float = 0.25            # Radial collision clearance margin (mm)
     pump_mm3_per_e_mm: float = 1.50                 # Volumetric pump calibration (mm^3 per E-mm)

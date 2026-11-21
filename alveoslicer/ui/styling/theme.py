@@ -284,9 +284,13 @@ QSplitter::handle:vertical {{ height: 4px; margin: 1px 4px; }}
 QSplitter::handle:hover {{ background-color: {p.accent}; }}
 
 /* ---- Cards, Floating Viewport Rails & GroupBoxes ---- */
-QFrame#card, QFrame#presetBar, QFrame#toolStrip {{
+QFrame#card, QFrame#sidebarCard, QFrame#presetBar, QFrame#toolStrip {{
     background-color: {p.bg_surface}; border: 1px solid {p.border}; border-radius: 6px;
 }}
+QFrame#statTile {{
+    background-color: {p.bg_input}; border: 1px solid {p.border}; border-radius: 5px;
+}}
+QWidget#cardInner {{ background-color: transparent; }}
 QFrame#floatingCard {{
     background-color: {p.overlay_bg}; border: 1px solid {p.overlay_border}; border-radius: 6px;
 }}
@@ -321,11 +325,11 @@ QListWidget#categoryList::item:selected {{
 }}
 QListWidget#objectList {{
     background-color: {p.bg_input}; border: 1px solid {p.border};
-    border-radius: 5px; padding: 3px; outline: none;
+    border-radius: 5px; padding: 2px; outline: none;
 }}
-QListWidget#objectList::item {{ padding: 5px 8px; margin: 1px 0; border-radius: 4px; color: {p.text_primary}; }}
+QListWidget#objectList::item {{ padding: 0px; margin: 1px 0; border-radius: 4px; color: {p.text_primary}; }}
 QListWidget#objectList::item:hover {{ background-color: {p.bg_elevated}; }}
-QListWidget#objectList::item:selected {{ background-color: {p.accent_soft}; color: {accent_text}; font-weight: 600; }}
+QListWidget#objectList::item:selected {{ background-color: {p.accent_soft}; border: 1px solid {p.accent_border_soft}; color: {accent_text}; }}
 
 /* ---- Inputs & Checkboxes ---- */
 QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {{
@@ -395,9 +399,31 @@ QPushButton#plateTab {{
 QPushButton#plateTab:hover, QPushButton#viewToggle:hover {{ border-color: {p.accent}; color: {p.text_primary}; }}
 QPushButton#iconSmallBtn {{
     background-color: {p.bg_elevated}; border: 1px solid {p.border_strong};
-    border-radius: 5px; padding: 4px 8px; min-width: 24px; color: {p.text_secondary};
+    border-radius: 5px; padding: 3px 6px; min-width: 22px; color: {p.text_secondary};
 }}
 QPushButton#iconSmallBtn:hover {{ border-color: {p.accent}; color: {accent_text}; }}
+QPushButton#cardIconBtn {{
+    background-color: transparent; border: 1px solid transparent;
+    border-radius: 4px; padding: 2px; min-width: 24px; min-height: 24px; color: {p.text_secondary};
+}}
+QPushButton#cardIconBtn:hover {{ background-color: {p.bg_elevated}; border-color: {p.border_strong}; color: {accent_text}; }}
+QPushButton#cardIconBtn:checked {{ background-color: {p.accent_soft}; border-color: {p.accent}; color: {accent_text}; }}
+QPushButton#cardIconBtn:disabled {{ color: {p.text_disabled}; background-color: transparent; border-color: transparent; }}
+QPushButton#miniChipBtn {{
+    background-color: {p.bg_elevated}; border: 1px solid {p.border_strong};
+    border-radius: 4px; padding: 2px 6px; font-size: 11px; font-weight: 600; color: {p.text_secondary};
+}}
+QPushButton#miniChipBtn:hover {{ border-color: {p.accent}; color: {accent_text}; }}
+QPushButton#miniChipBtn:disabled {{ background-color: {p.bg_disabled}; color: {p.text_disabled}; border-color: {p.border}; }}
+QPushButton#unitToggle {{
+    background-color: {p.bg_input}; border: 1px solid {p.border_strong};
+    border-radius: 4px; padding: 1px 6px; min-width: 24px; min-height: 18px;
+    font-size: 10px; font-weight: 700; color: {p.text_muted};
+}}
+QPushButton#unitToggle:hover {{ border-color: {p.accent}; color: {p.text_primary}; }}
+QPushButton#unitToggle:checked {{
+    background-color: {p.accent}; border-color: {p.accent}; color: {p.accent_fg};
+}}
 QPushButton#themeBtn {{
     background-color: transparent; border: 1px solid transparent; border-radius: 4px;
     padding: 3px 8px; font-size: 11px; font-weight: 600; color: {p.text_muted};
@@ -450,6 +476,14 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; 
 /* ---- Labels & Badges ---- */
 QLabel {{ background-color: transparent; }}
 QLabel#sectionTitle {{ font-size: 12px; font-weight: 700; color: {accent_text}; }}
+QLabel#cardHeader {{ font-size: 11px; font-weight: 700; color: {accent_text}; letter-spacing: 0.4px; }}
+QLabel#countPill {{
+    background-color: {p.bg_elevated}; color: {p.text_secondary};
+    border: 1px solid {p.border}; border-radius: 9px;
+    padding: 0px 6px; font-size: 10px; font-weight: 700;
+}}
+QLabel#statLabel {{ color: {p.text_muted}; font-size: 10px; font-weight: 600; }}
+QLabel#statValue {{ color: {p.text_primary}; font-size: 11px; font-weight: 700; }}
 QLabel#mutedLabel {{ color: {p.text_muted}; font-size: 11px; }}
 QLabel#accentValue {{ color: {accent_text}; font-weight: 700; font-size: 11px; }}
 QLabel#modifiedPill {{
@@ -459,11 +493,11 @@ QLabel#modifiedPill {{
 }}
 QLabel#modeBannerHybrid {{
     background-color: {banner_hybrid_bg}; border: 1px solid {p.accent_border_soft};
-    border-radius: 5px; padding: 6px 10px; color: {banner_hybrid_fg}; font-weight: 700;
+    border-radius: 4px; padding: 2px 7px; color: {banner_hybrid_fg}; font-size: 10px; font-weight: 700;
 }}
 QLabel#modeBannerFFF {{
     background-color: {banner_fff_bg}; border: 1px solid {banner_fff_bd};
-    border-radius: 5px; padding: 6px 10px; color: {banner_fff_fg}; font-weight: 700;
+    border-radius: 4px; padding: 2px 7px; color: {banner_fff_fg}; font-size: 10px; font-weight: 700;
 }}
 """
 

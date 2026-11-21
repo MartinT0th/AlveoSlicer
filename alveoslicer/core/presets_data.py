@@ -116,6 +116,7 @@ CATEGORY_FIELDS: Dict[str, Tuple[Tuple[Optional[str], str], ...]] = {
         ("fff", "z_hop_mm"), ("fff", "wipe_on_retract"), ("fff", "retract_on_layer_change"),
     ),
     "resin": (
+        ("resin", "resin_density_g_cm3"),
         ("resin", "x_min_layers"), ("resin", "x_max_layers"),
         ("resin", "max_cure_depth_mm"), ("resin", "cure_depth_safety_eta"),
         ("resin", "headspace_margin_mm"), ("resin", "shrinkage_factor"),
@@ -216,17 +217,20 @@ BUILTIN_PRESET_SPECS: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {
     "filament": [
         ("Generic PLA", {}),
         ("Translucent PLA (UV-Friendly)", {
+            "fff.filament_type": "PLA", "fff.filament_density_g_cm3": 1.24,
             "fff.nozzle_temp_c": 205, "fff.first_layer_nozzle_temp_c": 210, "fff.bed_temp_c": 60,
             "fff.first_layer_bed_temp_c": 60, "fff.part_cooling_fan_pct": 100, "fff.min_fan_speed_pct": 60,
             "fff.fan_disable_first_layers": 1, "fff.retract_length_mm": 1.0,
         }),
         ("Prusament PETG", {
+            "fff.filament_type": "PETG", "fff.filament_density_g_cm3": 1.27,
             "fff.nozzle_temp_c": 240, "fff.first_layer_nozzle_temp_c": 235, "fff.bed_temp_c": 85,
             "fff.first_layer_bed_temp_c": 85, "fff.part_cooling_fan_pct": 50, "fff.min_fan_speed_pct": 30,
             "fff.fan_disable_first_layers": 3, "fff.retract_length_mm": 1.4, "fff.retract_speed_mm_s": 30.0,
             "fff.z_hop_mm": 0.6,
         }),
         ("Generic ASA / ABS", {
+            "fff.filament_type": "ASA", "fff.filament_density_g_cm3": 1.07,
             "fff.nozzle_temp_c": 255, "fff.first_layer_nozzle_temp_c": 260, "fff.bed_temp_c": 105,
             "fff.first_layer_bed_temp_c": 105, "fff.part_cooling_fan_pct": 20, "fff.min_fan_speed_pct": 15,
             "fff.fan_disable_first_layers": 4, "fff.retract_length_mm": 0.8, "fff.retract_speed_mm_s": 40.0,
@@ -236,15 +240,18 @@ BUILTIN_PRESET_SPECS: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {
     "resin": [
         ("Standard 405nm Photopolymer", {}),
         ("Fast-Cure Clear Resin", {
+            "resin.resin_density_g_cm3": 1.10,
             "resin.x_min_layers": 4, "resin.x_max_layers": 7, "resin.max_cure_depth_mm": 1.65,
             "resin.settle_dwell_ms": 1500, "resin.max_flow_radius_mm": 12.0, "resin.shrinkage_factor": 1.03,
         }),
         ("Tough Engineering Resin", {
+            "resin.resin_density_g_cm3": 1.15,
             "resin.x_min_layers": 3, "resin.x_max_layers": 5, "resin.max_cure_depth_mm": 1.20,
             "resin.cure_depth_safety_eta": 0.82, "resin.settle_dwell_ms": 3500,
             "resin.shrinkage_factor": 1.05, "resin.max_flow_radius_mm": 8.5,
         }),
         ("High-Viscosity Structural Resin", {
+            "resin.resin_density_g_cm3": 1.18,
             "resin.x_min_layers": 2, "resin.x_max_layers": 5, "resin.max_cure_depth_mm": 1.15,
             "resin.settle_dwell_ms": 4500, "resin.max_flow_radius_mm": 7.0, "resin.headspace_margin_mm": 0.18,
         }),

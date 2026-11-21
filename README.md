@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="AlveoSlicerLogo.png" alt="AlveoSlicer Logo" width="140" />
+  <img src="alveoslicer/assets/AlveoSlicerLogo.png" alt="AlveoSlicer Logo" width="140" />
 </p>
 
 <h1 align="center">AlveoSlicer</h1>
@@ -141,16 +141,14 @@ AlveoSlicer/
 ├── CONTRIBUTING.md                  # Contributor guide, invariants & PR checklist
 ├── LICENSE                          # GNU AGPL v3.0 license
 ├── SECURITY.md                      # Software & physical printer UV/thermal safety reporting
-├── AlveoSlicerLogo.png              # Project logo artwork
-├── pyproject.toml                   # Package metadata, optional [ui]/[step]/[all] extras & CLI entry points
+├── pyproject.toml                   # Package metadata, version single source of truth, extras & CLI entry points
 ├── README.md                        # Project overview, architecture & user manual
 ├── packaging/                       # Standalone portable executable build scripts
 │   ├── launch_gui.py                #   Frozen PyInstaller GUI entry point
 │   └── build_exe.py                 #   Single-file Windows AlveoSlicer.exe builder
 ├── alveoslicer/
-│   ├── __init__.py                  # Lazy public Python facade (re-exports core config, scene, pipeline, HALs, parser)
+│   ├── __init__.py                  # Lazy public Python facade (reads __version__ from pyproject.toml)
 │   ├── __main__.py                  # Enables `python -m alveoslicer`
-│   ├── _version.py                  # Single source of truth for application version string
 │   ├── pipeline.py                  # Unified 6-stage orchestrator (SliceResult, slice_mesh, run_slicer; multi-body aware)
 │   ├── cli.py                       # Command-line interface & argument parser
 │   │

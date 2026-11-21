@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSlider,
     QSplitter,
@@ -41,7 +42,9 @@ from .panels import (
     build_legend_card,
     build_paint_popover,
     build_right_sidebar,
+    filament_mm_to_grams,
     format_duration,
+    resin_ml_to_grams,
 )
 
 _TOOL_HINTS: Dict[str, str] = {
@@ -106,6 +109,13 @@ class PlaterView(QWidget):
         self._current_view: str = "editor"
         self._current_tool: str = "select"
         self._resolved_theme: str = "dark"
+        self._filament_unit: str = "m"
+        self._resin_unit: str = "ml"
+        self._last_filament_mm: Optional[float] = None
+        self._last_resin_ml: Optional[float] = None
+        self._filament_diameter_mm: float = 1.75
+        self._filament_density_g_cm3: float = 1.24
+        self._resin_density_g_cm3: float = 1.12
 
         self._tool_buttons: Dict[str, QPushButton] = {}
         self._icon_registry: List[Tuple[QPushButton, str, int, bool]] = []
@@ -525,18 +535,59 @@ class PlaterView(QWidget):
         instances: List[ModelInstance],
         selected_id: Optional[str],
     ) -> None:
-        """Sync the Build Plate Objects list widget and selected-object transform fields."""
+        """Sync the streamlined Build Plate Objects list, count badge, and dynamic height."""
         self._suppress_obj_list = True
         try:
             self.list_objects.clear()
             sel_row = -1
             for row_idx, inst in enumerate(instances):
                 ext = inst.transformed_mesh().extents
-                item = QListWidgetItem(f"{inst.name}   ({ext[0]:.0f}×{ext[1]:.0f}×{ext[2]:.0f} mm)")
+                is_sel = inst.instance_id == selected_id
+                item = QListWidgetItem()
                 item.setData(Qt.ItemDataRole.UserRole, inst.instance_id)
+                item.setSizeHint(QSize(0, 28))
                 self.list_objects.addItem(item)
-                if inst.instance_id == selected_id:
+
+                row_w = QWidget()
+                row_w.setObjectName("cardInner")
+                rh = QHBoxLayout(row_w)
+                rh.setContentsMargins(9, 2, 10, 2)
+                rh.setSpacing(6)
+
+                dot = QLabel("●")
+                dot.setObjectName("accentValue" if is_sel else "mutedLabel")
+                dot.setFixedWidth(10)
+
+                name_lbl = QLabel(inst.name)
+                name_lbl.setMinimumWidth(0)
+                name_lbl.setStyleSheet("font-weight: 600; font-size: 11px;")
+                name_lbl.setToolTip(
+                    f"{inst.name} — {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm"
+                )
+
+                dim_lbl = QLabel(f"{ext[0]:.0f}×{ext[1]:.0f}×{ext[2]:.0f} mm")
+                dim_lbl.setObjectName("mutedLabel")
+                dim_lbl.setStyleSheet("font-size: 10px;")
+                dim_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+                rh.addWidget(dot)
+                rh.addWidget(name_lbl, stretch=1)
+                rh.addWidget(dim_lbl)
+                self.list_objects.setItemWidget(item, row_w)
+
+                if is_sel:
                     sel_row = row_idx
+
+            count = len(instances)
+            self.lbl_obj_count.setText(str(count))
+            self.list_objects.setVisible(count > 0)
+            self.lbl_objects_empty.setVisible(count == 0)
+            if count > 0:
+                visible_rows = min(count, 4)
+                self.list_objects.setFixedHeight(visible_rows * 30 + 6)
+                self.list_objects.updateGeometries()
+                self.list_objects.doItemsLayout()
+
             if sel_row >= 0:
                 self.list_objects.setCurrentRow(sel_row)
             else:
@@ -548,8 +599,34 @@ class PlaterView(QWidget):
         selected = next((i for i in instances if i.instance_id == selected_id), None)
         self.update_selected_instance_inspector(selected)
 
+    def _show_object_context_menu(self, pos: QPoint) -> None:
+        """Display a quick-action context menu when right-clicking an object in the list."""
+        item = self.list_objects.itemAt(pos)
+        if item is None:
+            return
+        self.list_objects.setCurrentItem(item)
+        menu = QMenu(self)
+        act_clone = menu.addAction("Clone")
+        act_center = menu.addAction("Center on Bed")
+        act_drop = menu.addAction("Drop to Bed (Z = 0)")
+        act_plate = menu.addAction("Move to Plate...")
+        menu.addSeparator()
+        act_del = menu.addAction("Remove")
+
+        chosen = menu.exec(self.list_objects.viewport().mapToGlobal(pos))
+        if chosen is act_clone:
+            self.duplicate_instance_requested.emit()
+        elif chosen is act_center:
+            self.center_model_requested.emit()
+        elif chosen is act_drop:
+            self.drop_model_requested.emit()
+        elif chosen is act_plate:
+            self.move_to_plate_requested.emit()
+        elif chosen is act_del:
+            self.remove_instance_requested.emit()
+
     def update_selected_instance_inspector(self, inst: Optional[ModelInstance]) -> None:
-        """Populate or disable the transform, cut, and paint widgets for ``inst``."""
+        """Populate or collapse the Object Manipulation, cut, and paint widgets for ``inst``."""
         has_inst = inst is not None
         for w in (
             self.btn_dup_inst, self.btn_move_plate, self.btn_del_inst,
@@ -563,6 +640,9 @@ class PlaterView(QWidget):
         ):
             w.setEnabled(has_inst)
 
+        self._transform_body.setVisible(has_inst)
+        self._transform_empty_lbl.setVisible(not has_inst)
+
         self._suppress_transform = True
         try:
             if inst is not None:
@@ -570,7 +650,7 @@ class PlaterView(QWidget):
                 ext = mesh.extents
                 self.lbl_model_name.setText(inst.name)
                 self.lbl_model_dims.setText(
-                    f"Size: {ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} mm  |  {len(mesh.faces):,} faces"
+                    f"{ext[0]:.1f}×{ext[1]:.1f}×{ext[2]:.1f} mm · {len(mesh.faces):,} tris"
                 )
                 self.sp_pos_x.setValue(inst.pos_x)
                 self.sp_pos_y.setValue(inst.pos_y)
@@ -585,7 +665,7 @@ class PlaterView(QWidget):
                 self.update_paint_counts(*inst.paint_counts())
             else:
                 self.lbl_model_name.setText("No object selected")
-                self.lbl_model_dims.setText("Size: —   |   Faces: —")
+                self.lbl_model_dims.setText("—")
                 self.update_paint_counts(0, 0)
         finally:
             self._suppress_transform = False
@@ -604,29 +684,84 @@ class PlaterView(QWidget):
                     sel_idx = idx
             if presets:
                 cb.setCurrentIndex(sel_idx)
+                cb.setToolTip(cb.currentText())
         finally:
             self._suppress_presets = False
         self._preset_mod_labels[category].setVisible(is_modified)
 
     def set_preset_modified(self, category: str, is_modified: bool) -> None:
-        """Show or hide the ``* modified`` badge next to a sidebar preset dropdown."""
+        """Show or hide the modified indicator dot next to a sidebar preset dropdown."""
         self._preset_mod_labels[category].setVisible(is_modified)
 
     def update_mode_badge(self, cfg: SlicerConfig) -> None:
-        """Update the Hybrid vs. Standard FFF banner in the Slice Summary card."""
+        """Update the Hybrid vs. Standard FFF pill badge in the Slice Summary card."""
         pump, uv = cfg.hybrid.enable_resin_pumping, cfg.hybrid.enable_uv_curing
         if pump and uv:
-            text, obj = "HYBRID: FFF + RESIN + UV", "modeBannerHybrid"
+            text, tip, obj = "HYBRID", "Hybrid Mode: FFF + Photopolymer Resin + UV Curing", "modeBannerHybrid"
         elif pump:
-            text, obj = "RESIN DOSING ONLY (NO UV)", "modeBannerHybrid"
+            text, tip, obj = "DOSING ONLY", "Resin Dosing Only (Manual External UV)", "modeBannerHybrid"
         elif uv:
-            text, obj = "FFF + UV SWEEP (NO DOSING)", "modeBannerHybrid"
+            text, tip, obj = "FFF + UV", "FFF + UV Sweep (No Resin Dosing)", "modeBannerHybrid"
         else:
-            text, obj = "STANDARD FFF ONLY", "modeBannerFFF"
+            text, tip, obj = "STANDARD FFF", "Standard FFF Only (No Resin / No UV)", "modeBannerFFF"
         self.lbl_mode_badge.setText(text)
+        self.lbl_mode_badge.setToolTip(tip)
         self.lbl_mode_badge.setObjectName(obj)
         self.lbl_mode_badge.style().unpolish(self.lbl_mode_badge)
         self.lbl_mode_badge.style().polish(self.lbl_mode_badge)
+
+    def update_material_properties(self, cfg: SlicerConfig) -> None:
+        """Sync filament diameter/density and resin density for live mass calculations."""
+        self._filament_diameter_mm = float(cfg.fff.filament_diameter)
+        self._filament_density_g_cm3 = float(cfg.fff.filament_density_g_cm3)
+        self._resin_density_g_cm3 = float(cfg.resin.resin_density_g_cm3)
+        self._refresh_material_summary()
+
+    def set_filament_unit(self, unit: str) -> None:
+        """Switch Slice Summary filament readout between meters (``'m'``) and grams (``'g'``)."""
+        self._filament_unit = "g" if unit.lower() == "g" else "m"
+        self.btn_fil_unit_m.setChecked(self._filament_unit == "m")
+        self.btn_fil_unit_g.setChecked(self._filament_unit == "g")
+        self._refresh_material_summary()
+
+    def set_resin_unit(self, unit: str) -> None:
+        """Switch Slice Summary resin readout between milliliters (``'ml'``) and grams (``'g'``)."""
+        self._resin_unit = "g" if unit.lower() == "g" else "ml"
+        self.btn_res_unit_ml.setChecked(self._resin_unit == "ml")
+        self.btn_res_unit_g.setChecked(self._resin_unit == "g")
+        self._refresh_material_summary()
+
+    def _refresh_material_summary(self) -> None:
+        """Format cached filament length and resin volume in the user's selected units."""
+        if self._last_filament_mm is None:
+            self.lbl_stat_filament.setText("—")
+            self.lbl_stat_filament.setToolTip("")
+        else:
+            meters = self._last_filament_mm / 1000.0
+            grams = filament_mm_to_grams(
+                self._last_filament_mm, self._filament_diameter_mm, self._filament_density_g_cm3
+            )
+            if self._filament_unit == "g":
+                self.lbl_stat_filament.setText(f"{grams:.2f} g")
+            else:
+                self.lbl_stat_filament.setText(f"{meters:.2f} m")
+            self.lbl_stat_filament.setToolTip(
+                f"{meters:.2f} m  ({grams:.2f} g at {self._filament_density_g_cm3:.2f} g/cm³, Ø{self._filament_diameter_mm:.2f} mm)"
+            )
+
+        if self._last_resin_ml is None:
+            self.lbl_stat_resin.setText("—")
+            self.lbl_stat_resin.setToolTip("")
+        else:
+            ml = self._last_resin_ml
+            grams = resin_ml_to_grams(ml, self._resin_density_g_cm3)
+            if self._resin_unit == "g":
+                self.lbl_stat_resin.setText(f"{grams:.2f} g")
+            else:
+                self.lbl_stat_resin.setText(f"{ml:.2f} mL")
+            self.lbl_stat_resin.setToolTip(
+                f"{ml:.2f} mL  ({grams:.2f} g at {self._resin_density_g_cm3:.2f} g/cm³)"
+            )
 
     def set_slice_result(
         self,
@@ -644,13 +779,16 @@ class PlaterView(QWidget):
             self.btn_mode_basins.setEnabled(True)
             self.lbl_stat_layers.setText(str(len(res.layers)))
             self.lbl_stat_cycles.setText(str(len(res.schedule)))
-            self.lbl_stat_filament.setText(f"{res.total_filament_mm / 1000.0:.2f} m")
-            self.lbl_stat_resin.setText(f"{res.total_resin_ml:.2f} mL")
+            self._last_filament_mm = float(res.total_filament_mm)
+            self._last_resin_ml = float(res.total_resin_ml)
+            self._refresh_material_summary()
             self.lbl_stat_time.setText(format_duration(res.est_print_time_s))
             self.lbl_stat_lines.setText(f"{res.gcode_line_count:,}")
             self.btn_export.setEnabled(True)
         else:
             self.btn_mode_basins.setEnabled(False)
+            self._last_filament_mm = None
+            self._last_resin_ml = None
             for lbl in (
                 self.lbl_stat_layers, self.lbl_stat_cycles, self.lbl_stat_filament,
                 self.lbl_stat_resin, self.lbl_stat_time, self.lbl_stat_lines,
@@ -666,8 +804,9 @@ class PlaterView(QWidget):
             if res is None:
                 self.lbl_stat_layers.setText(str(preview.num_layers))
                 self.lbl_stat_cycles.setText(str(len(preview.cure_layers)))
-                self.lbl_stat_filament.setText(f"{preview.total_filament_mm / 1000.0:.2f} m")
-                self.lbl_stat_resin.setText(f"{preview.total_resin_ml:.2f} mL")
+                self._last_filament_mm = float(preview.total_filament_mm)
+                self._last_resin_ml = float(preview.total_resin_ml)
+                self._refresh_material_summary()
                 self.lbl_stat_time.setText(preview.est_time_str or "—")
                 self.lbl_stat_lines.setText("External")
                 self.btn_export.setEnabled(True)
