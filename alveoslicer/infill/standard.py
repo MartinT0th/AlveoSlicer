@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import shapely
 import shapely.affinity
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, MultiLineString, Polygon
 
 from ..core.config import SlicerConfig
 from ..core.geometry import (
@@ -35,33 +35,59 @@ def hatch_polygon(
     spacing: float,
     angle_deg: float,
     phase: float = 0.0,
+    alternating: bool = True,
+    min_area: float = 0.05,
 ) -> List[np.ndarray]:
-    """Generate alternating monotonic parallel hatch lines clipped to ``geom`` at ``angle_deg``."""
+    """Generate parallel hatch lines clipped to ``geom`` at ``angle_deg``."""
     g = clean_geom(geom)
-    if g.is_empty or g.area < 0.05:
+    if g.is_empty or g.area < min_area:
         return []
-    sp = max(0.3, float(spacing))
-    rot = clean_geom(shapely.affinity.rotate(g, -angle_deg, origin=(0.0, 0.0)))
+    sp = max(0.05, float(spacing))
+    rot = shapely.affinity.rotate(g, -angle_deg, origin=(0.0, 0.0))
     if rot.is_empty:
         return []
 
     minx, miny, maxx, maxy = rot.bounds
-    y_val = (
+    y_start = (
         math.floor((miny - phase) / sp) * sp + phase
         if phase != 0.0
         else miny + 0.5 * sp
     )
+    ys = np.arange(y_start, maxy + 1e-6, sp, dtype=np.float64)
+    if len(ys) == 0:
+        return []
+
+    n_rows = len(ys)
+    seg_coords = np.empty((n_rows, 2, 2), dtype=np.float64)
+    seg_coords[:, 0, 0] = minx - 2.0
+    seg_coords[:, 1, 0] = maxx + 2.0
+    seg_coords[:, 0, 1] = ys
+    seg_coords[:, 1, 1] = ys
+    scanlines = shapely.linestrings(seg_coords)
+
+    shapely.prepare(rot)
+    try:
+        inters = shapely.intersection(rot, scanlines)
+    except Exception:
+        rot_c = clean_geom(rot)
+        try:
+            inters = shapely.intersection(rot_c, scanlines)
+        except Exception:
+            inters = shapely.intersection(shapely.set_precision(rot_c, 1e-4), scanlines)
+
+    rad = math.radians(angle_deg)
+    ca, sa = math.cos(rad), math.sin(rad)
+    rot_mat = np.array([[ca, sa], [-sa, ca]], dtype=np.float64)
+
     lines: List[np.ndarray] = []
-    flip = False
-    while y_val <= maxy + 1e-6:
-        inter = safe_intersection(rot, LineString([(minx - 2.0, y_val), (maxx + 2.0, y_val)]))
+    for row_idx, inter in enumerate(inters):
+        if inter is None or inter.is_empty:
+            continue
+        flip = alternating and ((row_idx & 1) == 1)
         for coords in extract_polylines(inter):
             if flip:
                 coords = coords[::-1]
-            unrot = shapely.affinity.rotate(LineString(coords), angle_deg, origin=(0.0, 0.0))
-            lines.append(np.asarray(unrot.coords, dtype=np.float64))
-        y_val += sp
-        flip = not flip
+            lines.append(coords @ rot_mat)
     return lines
 
 
@@ -73,7 +99,7 @@ def honeycomb_hatch_polygon(geom: shapely.Geometry, spacing: float) -> List[np.n
     minx, miny, maxx, maxy = g.bounds
     s = max(1.0, float(spacing))
     dx, dy = s * 0.5, s * math.sqrt(3.0) * 0.5
-    lines: List[np.ndarray] = []
+    row_lines: List[List[Tuple[float, float]]] = []
     row, y = 0, miny - dy
     while y <= maxy + dy:
         pts: List[Tuple[float, float]] = []
@@ -84,10 +110,12 @@ def honeycomb_hatch_polygon(geom: shapely.Geometry, spacing: float) -> List[np.n
             x += 1.5 * s
             col += 1
         if len(pts) >= 2:
-            lines.extend(extract_polylines(safe_intersection(g, LineString(pts))))
+            row_lines.append(pts)
         y += dy
         row += 1
-    return lines
+    if not row_lines:
+        return []
+    return extract_polylines(safe_intersection(g, MultiLineString(row_lines)))
 
 
 def hilbert_curve_points(order: int) -> np.ndarray:
@@ -109,6 +137,28 @@ def hilbert_curve_points(order: int) -> np.ndarray:
             s *= 2
         pts[d] = ((x + 0.5) / n, (y + 0.5) / n)
     return pts
+
+
+def _anchor_hatch_segments(
+    lines: List[np.ndarray],
+    boundary: shapely.Geometry,
+    anchor_mm: float,
+    anchor_max_mm: float,
+) -> List[np.ndarray]:
+    """Connect nearby open hatch endpoints with short perimeter-following anchors along ``boundary``."""
+    if anchor_max_mm <= 0.1 or anchor_mm <= 0.05 or len(lines) < 2:
+        return lines
+    max_step = max(anchor_mm, anchor_max_mm)
+    anchored: List[np.ndarray] = [lines[0]]
+    for seg in lines[1:]:
+        prev = anchored[-1]
+        if len(prev) >= 2 and len(seg) >= 2:
+            gap = math.hypot(float(seg[0, 0] - prev[-1, 0]), float(seg[0, 1] - prev[-1, 1]))
+            if 0.05 < gap <= max_step and boundary.distance(LineString([prev[-1], seg[0]])) <= 0.35:
+                anchored[-1] = np.vstack([prev, seg])
+                continue
+        anchored.append(seg)
+    return anchored
 
 
 def generate_standard_infill_layer(
@@ -146,7 +196,7 @@ def generate_standard_infill_layer(
     active_region = region
     if (icfg.only_infill_where_needed or icfg.standard_fill_pattern == "lightning") and not force_solid:
         if roof_support_mask is not None and not roof_support_mask.is_empty:
-            active_region = clean_geom(safe_intersection(region, roof_support_mask))
+            active_region = safe_intersection(region, roof_support_mask)
             if active_region.is_empty or active_region.area < lw * lw:
                 return [], Polygon()
         elif icfg.only_infill_where_needed:
@@ -226,11 +276,13 @@ def generate_standard_infill_layer(
                 + np.sin(k_w * yy) * math.cos(kz)
                 + math.sin(kz) * np.cos(k_w * xx)
             )
-            for contour in sk_measure.find_contours(g_val, level=0.0):
-                if len(contour) < 2:
-                    continue
-                ls = LineString(np.column_stack([bx0 - step_g + contour[:, 0] * step_g, by0 - step_g + contour[:, 1] * step_g]))
-                lines.extend(extract_polylines(safe_intersection(fill_reg, ls)))
+            raw_contours = [
+                np.column_stack([bx0 - step_g + contour[:, 0] * step_g, by0 - step_g + contour[:, 1] * step_g])
+                for contour in sk_measure.find_contours(g_val, level=0.0)
+                if len(contour) >= 2
+            ]
+            if raw_contours:
+                lines.extend(extract_polylines(safe_intersection(fill_reg, MultiLineString(raw_contours))))
     elif pat == "concentric":
         cur = safe_buffer(fill_reg, -0.5 * lw, join_style=1)
         iters = 0
@@ -280,4 +332,8 @@ def generate_standard_infill_layer(
     else:
         lines.extend(hatch_polygon(fill_reg, spacing, base_ang if (layer_idx0 % 2 == 0) else (base_ang + 90.0)))
 
+    if pat in ("rectilinear", "aligned_rectilinear", "line", "grid", "triangles"):
+        lines = _anchor_hatch_segments(
+            lines, fill_reg.boundary, icfg.infill_anchor_mm, icfg.infill_anchor_max_mm
+        )
     return lines, Polygon()

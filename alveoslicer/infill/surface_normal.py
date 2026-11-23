@@ -9,15 +9,17 @@ with shallow-face flattening for support-free printing inside hybrid photopolyme
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
+import shapely
 import trimesh
 from scipy.spatial import cKDTree
 from skimage import measure
 
 from ..core.config import SlicerConfig
-from ..core.geometry import VolumetricField, split_mesh_bodies
+from ..core.geometry import VolumetricField, clean_geom, extract_polylines, safe_buffer, split_mesh_bodies
+from ..slicing.layer import _slice_mesh_plane_exact
 from .lattice import Capsule, CellHalfPlane, NormalVoronoiLattice, combine_lattices
 
 # -----------------------------------------------------------------------------
@@ -25,22 +27,72 @@ from .lattice import Capsule, CellHalfPlane, NormalVoronoiLattice, combine_latti
 # -----------------------------------------------------------------------------
 
 
+def _dedup_min_sep(points: np.ndarray, min_sep: float) -> np.ndarray:
+    """Greedy minimum-separation point filter using a spatial hash grid (O(N) vs O(N^2))."""
+    n = len(points)
+    if n == 0:
+        return np.zeros((0, points.shape[1] if points.ndim == 2 else 3), dtype=np.float64)
+    dim = points.shape[1]
+    min_r_sq = min_sep * min_sep
+    inv_cell = 1.0 / max(min_sep, 1e-6)
+    kept = np.empty((n, dim), dtype=np.float64)
+    count = 0
+    grid: Dict[Tuple[int, ...], List[int]] = {}
+    offsets = (
+        ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 0), (0, 1), (1, -1), (1, 0), (1, 1))
+        if dim == 2
+        else tuple((dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1))
+    )
+
+    for p in points:
+        if dim == 2:
+            cx, cy = int(math.floor(p[0] * inv_cell)), int(math.floor(p[1] * inv_cell))
+            too_close = False
+            for ox, oy in offsets:
+                bucket = grid.get((cx + ox, cy + oy))
+                if bucket:
+                    for bi in bucket:
+                        dx = kept[bi, 0] - p[0]
+                        dy = kept[bi, 1] - p[1]
+                        if dx * dx + dy * dy < min_r_sq:
+                            too_close = True
+                            break
+                    if too_close:
+                        break
+            if not too_close:
+                kept[count] = p
+                grid.setdefault((cx, cy), []).append(count)
+                count += 1
+        else:
+            cx = int(math.floor(p[0] * inv_cell))
+            cy = int(math.floor(p[1] * inv_cell))
+            cz = int(math.floor(p[2] * inv_cell))
+            too_close = False
+            for ox, oy, oz in offsets:
+                bucket = grid.get((cx + ox, cy + oy, cz + oz))
+                if bucket:
+                    for bi in bucket:
+                        dx = kept[bi, 0] - p[0]
+                        dy = kept[bi, 1] - p[1]
+                        dz = kept[bi, 2] - p[2]
+                        if dx * dx + dy * dy + dz * dz < min_r_sq:
+                            too_close = True
+                            break
+                    if too_close:
+                        break
+            if not too_close:
+                kept[count] = p
+                grid.setdefault((cx, cy, cz), []).append(count)
+                count += 1
+    return kept[:count].copy()
+
+
 def _poisson_disk_sample(points: np.ndarray, min_radius: float, seed: int) -> np.ndarray:
     """Greedy Poisson-disk subsampling of a 3D point cloud with deterministic RNG seed."""
     if len(points) == 0:
         return np.zeros((0, 3), dtype=np.float64)
     rng = np.random.default_rng(seed)
-    min_r_sq = min_radius * min_radius
-    chosen: List[np.ndarray] = []
-    for idx in rng.permutation(len(points)):
-        p = points[idx]
-        if not chosen:
-            chosen.append(p)
-            continue
-        diffs = np.asarray(chosen) - p
-        if np.min(np.einsum("ij,ij->i", diffs, diffs)) >= min_r_sq:
-            chosen.append(p)
-    return np.asarray(chosen, dtype=np.float64)
+    return _dedup_min_sep(points[rng.permutation(len(points))], min_radius)
 
 
 def _fast_lloyd_cvt(surf_pts: np.ndarray, seeds: np.ndarray, iters: int) -> np.ndarray:
@@ -145,17 +197,7 @@ def _sample_contour_at_arc_steps(contour_xy: np.ndarray, ds: float, min_3d_sep: 
     raw = np.column_stack([xs, ys])
 
     # Deduplicate opposing sides of a thin curved wall so front/back share aligned regular cells
-    kept: List[np.ndarray] = []
-    min_sep_sq = min_3d_sep * min_3d_sep
-    for p in raw:
-        if not kept:
-            kept.append(p)
-            continue
-        arr_k = np.asarray(kept)
-        d2 = np.sum((arr_k - p) ** 2, axis=1)
-        if float(np.min(d2)) >= min_sep_sq:
-            kept.append(p)
-    return np.asarray(kept, dtype=np.float64)
+    return _dedup_min_sep(raw, min_3d_sep)
 
 
 def _lattice_grid_params(pattern: str, pitch: float) -> Tuple[float, float, float, float]:
@@ -176,6 +218,47 @@ def _lattice_grid_params(pattern: str, pitch: float) -> Tuple[float, float, floa
     if pattern == "brick":
         return pitch * 1.35, pitch * 0.72, 0.0, 0.5 * pitch * 1.35
     return pitch * math.sqrt(3.0) * 0.5, pitch, 0.5 * pitch, 0.0
+
+
+def _snap_queries_to_surface(
+    mesh: trimesh.Trimesh,
+    surf_pts: np.ndarray,
+    pt_tree: cKDTree,
+    q_all: np.ndarray,
+    max_dist: float,
+) -> Optional[np.ndarray]:
+    """Keep query seeds within ``max_dist`` of ``surf_pts`` and project cleanly onto exact triangles when small."""
+    if len(q_all) == 0:
+        return None
+    dists, snap_idx = pt_tree.query(q_all, k=1)
+    valid = dists <= max_dist
+    if int(np.count_nonzero(valid)) < 4:
+        return None
+    q_valid = q_all[valid]
+    if len(q_valid) <= 1500 and 0 < len(mesh.faces) <= 5000:
+        try:
+            tri_arr = np.asarray(mesh.triangles, dtype=np.float64)
+            tri_centers = np.asarray(mesh.triangles_center, dtype=np.float64)
+            k_tri = min(12, len(tri_arr))
+            tri_tree = cKDTree(tri_centers)
+            _, cand_idx = tri_tree.query(q_valid, k=k_tri)
+            if k_tri == 1:
+                cand_idx = cand_idx[:, None]
+            best_pts = np.empty_like(q_valid)
+            best_d2 = np.full(len(q_valid), np.inf, dtype=np.float64)
+            for col in range(k_tri):
+                pts_c = np.asarray(
+                    trimesh.triangles.closest_point(tri_arr[cand_idx[:, col]], q_valid),
+                    dtype=np.float64,
+                )
+                d2 = np.sum((pts_c - q_valid) ** 2, axis=1)
+                better = d2 < best_d2
+                best_d2[better] = d2[better]
+                best_pts[better] = pts_c[better]
+            return best_pts
+        except Exception:
+            pass
+    return surf_pts[snap_idx[valid]]
 
 
 def _generate_developable_or_wall_seeds(
@@ -228,46 +311,46 @@ def _generate_developable_or_wall_seeds(
         raw_odd = np.column_stack(
             [np.interp(s_odd, cum, contour[:, 0]), np.interp(s_odd, cum, contour[:, 1])]
         )
-        cols_odd_list: List[np.ndarray] = []
-        min_sq = (du * 0.72) ** 2
-        for p in raw_odd:
-            if not cols_odd_list or float(np.min(np.sum((np.asarray(cols_odd_list) - p) ** 2, axis=1))) >= min_sq:
-                cols_odd_list.append(p)
-        cols_odd = np.asarray(cols_odd_list, dtype=np.float64) if cols_odd_list else cols_even
+        cols_odd = _dedup_min_sep(raw_odd, du * 0.72)
+        if len(cols_odd) == 0:
+            cols_odd = cols_even
 
-        pts: List[np.ndarray] = []
+        queries: List[np.ndarray] = []
         row = 0
         z_cur = z_min + 0.5 * dv
         while z_cur <= z_max + 0.35 * dv:
             col_set = cols_odd if (row % 2 == 1) else cols_even
-            for xy in col_set:
-                p3 = np.array([xy[0], xy[1], min(z_max, max(z_min, z_cur))], dtype=np.float64)
-                dist, snap_idx = pt_tree.query(p3, k=1)
-                if dist <= 0.65 * pitch:
-                    pts.append(surf_pts[snap_idx])
+            z_clamped = min(z_max, max(z_min, z_cur))
+            q_row = np.empty((len(col_set), 3), dtype=np.float64)
+            q_row[:, :2] = col_set
+            q_row[:, 2] = z_clamped
+            queries.append(q_row)
             z_cur += dv
             row += 1
-        return np.asarray(pts, dtype=np.float64) if len(pts) >= 4 else None
+        if not queries:
+            return None
+        return _snap_queries_to_surface(mesh, surf_pts, pt_tree, np.vstack(queries), 0.65 * pitch)
 
     # Column-shifted lattices (hexagonal, diamond, square)
     col_xy = _sample_contour_at_arc_steps(contour, du, min_3d_sep=du * 0.72)
     if len(col_xy) < 2:
         return None
 
-    pts = []
+    queries = []
     for c_idx, xy in enumerate(col_xy):
         z_shift = odd_col_dv if (c_idx % 2 == 1) else 0.0
-        z_cur = z_min + z_shift
-        while z_cur <= z_max + 0.35 * dv:
-            p3 = np.array([xy[0], xy[1], min(z_max, max(z_min, z_cur))], dtype=np.float64)
-            dist, snap_idx = pt_tree.query(p3, k=1)
-            if dist <= 0.65 * pitch:
-                pts.append(surf_pts[snap_idx])
-            z_cur += dv
+        zs = np.arange(z_min + z_shift, z_max + 0.35 * dv + 1e-9, dv, dtype=np.float64)
+        if len(zs) == 0:
+            continue
+        q_col = np.empty((len(zs), 3), dtype=np.float64)
+        q_col[:, 0] = xy[0]
+        q_col[:, 1] = xy[1]
+        q_col[:, 2] = np.clip(zs, z_min, z_max)
+        queries.append(q_col)
 
-    if len(pts) < 4:
+    if not queries:
         return None
-    return np.asarray(pts, dtype=np.float64)
+    return _snap_queries_to_surface(mesh, surf_pts, pt_tree, np.vstack(queries), 0.65 * pitch)
 
 
 def _generate_triplanar_lattice_seeds(
@@ -286,7 +369,6 @@ def _generate_triplanar_lattice_seeds(
     bmin, bmax = mesh.bounds[0], mesh.bounds[1]
     du, dv, odd_col_dv, odd_row_du = _lattice_grid_params(pattern, pitch)
     min_sep = pitch * (0.76 if pattern != "brick" else 0.60)
-    min_sep_sq = min_sep * min_sep
 
     candidates: List[np.ndarray] = []
 
@@ -314,36 +396,38 @@ def _generate_triplanar_lattice_seeds(
             n_probes.append(n_mid)
 
         u_vals = np.arange(u0, u1 + du, du)
+        q_list: List[np.ndarray] = []
         for col_idx, u_val in enumerate(u_vals):
             v_shift = odd_col_dv if (col_idx % 2 == 1) else 0.0
             v_vals = np.arange(v0 + v_shift, v1 + dv, dv)
-            for row_idx, v_val in enumerate(v_vals):
-                u_eff = u_val + (odd_row_du if (row_idx % 2 == 1) else 0.0)
-                for n_val in n_probes:
-                    q = np.zeros(3, dtype=np.float64)
-                    q[u_ax] = u_eff
-                    q[v_ax] = v_val
-                    q[n_ax] = n_val
-                    dist, s_idx = sub_tree.query(q, k=1)
-                    if dist <= max(du, dv) * 0.85:
-                        candidates.append(sub_pts[s_idx])
+            if len(v_vals) == 0:
+                continue
+            row_idx = np.arange(len(v_vals))
+            u_eff = u_val + np.where((row_idx & 1) == 1, odd_row_du, 0.0)
+            for n_val in n_probes:
+                q_blk = np.empty((len(v_vals), 3), dtype=np.float64)
+                q_blk[:, u_ax] = u_eff
+                q_blk[:, v_ax] = v_vals
+                q_blk[:, n_ax] = n_val
+                q_list.append(q_blk)
+        if q_list:
+            q_all = np.vstack(q_list)
+            dists, s_idx = sub_tree.query(q_all, k=1)
+            valid = dists <= max(du, dv) * 0.85
+            if np.any(valid):
+                candidates.append(sub_pts[s_idx[valid]])
 
     if not candidates:
         return _poisson_disk_sample(surf_pts, min_radius=pitch * 0.85, seed=42)
 
-    kept: List[np.ndarray] = []
-    for p in candidates:
-        if not kept:
-            kept.append(p)
-            continue
-        arr_k = np.asarray(kept)
-        if float(np.min(np.sum((arr_k - p) ** 2, axis=1))) >= min_sep_sq:
-            kept.append(p)
-    return np.asarray(kept, dtype=np.float64)
+    return _dedup_min_sep(np.vstack(candidates), min_sep)
 
 
 def _generate_outer_surface_seeds(
-    mesh: trimesh.Trimesh, pattern: str, pitch: float
+    mesh: trimesh.Trimesh,
+    pattern: str,
+    pitch: float,
+    sample_count: int = 24000,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Distribute cell seeds strictly on the 3D outer surface of the model:
@@ -354,7 +438,7 @@ def _generate_outer_surface_seeds(
       - 'triangular': starts from regular hexagonal dual vertices (dualized into triangles)
       - 'voronoi': jittered Poisson-disk sampling + 2-iter Lloyd CVT
     """
-    surf_pts, face_idx = trimesh.sample.sample_surface(mesh, count=24000)
+    surf_pts, face_idx = trimesh.sample.sample_surface(mesh, count=sample_count)
     surf_pts = np.asarray(surf_pts, dtype=np.float64)
     if len(surf_pts) == 0:
         return np.zeros((0, 3), dtype=np.float64), surf_pts
@@ -417,25 +501,20 @@ def _generate_outer_surface_seeds(
         u_min, u_max = float(proj_u.min()), float(proj_u.max())
         v_min, v_max = float(proj_v.min()), float(proj_v.max())
         du, dv, odd_col_dv, odd_row_du = _lattice_grid_params(base_pattern, pitch)
-        grid_pts = []
-        col_idx = 0
-        u_val = u_min
-        while u_val <= u_max + du:
+        u_vals = np.arange(u_min, u_max + du + 1e-9, du, dtype=np.float64)
+        q_chunks: List[np.ndarray] = []
+        for col_idx, u_val in enumerate(u_vals):
             v_shift = odd_col_dv if (col_idx % 2 == 1) else 0.0
-            row_idx = 0
-            v_val = v_min + v_shift
-            while v_val <= v_max + dv:
-                u_eff = u_val + (odd_row_du if (row_idx % 2 == 1) else 0.0)
-                p3 = mean_pt + u_eff * u_axis + v_val * v_axis
-                dist, snap_idx = pt_tree.query(p3, k=1)
-                if dist <= 0.65 * pitch:
-                    grid_pts.append(surf_pts[snap_idx])
-                v_val += dv
-                row_idx += 1
-            u_val += du
-            col_idx += 1
-        if len(grid_pts) >= 4:
-            return np.asarray(grid_pts, dtype=np.float64), surf_pts
+            v_vals = np.arange(v_min + v_shift, v_max + dv + 1e-9, dv, dtype=np.float64)
+            if len(v_vals) == 0:
+                continue
+            row_idx = np.arange(len(v_vals))
+            u_eff = u_val + np.where((row_idx & 1) == 1, odd_row_du, 0.0)
+            q_chunks.append(mean_pt + u_eff[:, None] * u_axis + v_vals[:, None] * v_axis)
+        if q_chunks:
+            snapped = _snap_queries_to_surface(mesh, surf_pts, pt_tree, np.vstack(q_chunks), 0.65 * pitch)
+            if snapped is not None:
+                return snapped, surf_pts
 
     # 4. General arbitrary 3D surface -> tri-planar regular lattice + equal-edge spring relaxation
     seeds = _generate_triplanar_lattice_seeds(mesh, surf_pts, surf_normals, pt_tree, base_pattern, pitch)
@@ -531,35 +610,15 @@ def _build_triangular_dual_lattice(
             if float(np.dot(out_n, p_opp - m)) > 0.0:
                 out_n = -out_n
 
-            tilt_from_horiz_deg = math.degrees(math.acos(min(1.0, abs(float(out_n[2])))))
-            if flatten_deg > 0.0 and tilt_from_horiz_deg < (flatten_deg - 1e-3):
-                if surf_tree is not None:
-                    _, snap_idx = surf_tree.query(m, k=1)
-                    z_anchor = float(surf_pts[snap_idx, 2])
-                else:
-                    z_anchor = float(m[2])
-                sign_z = 1.0 if out_n[2] >= 0.0 else -1.0
-                planes_t.append(
-                    CellHalfPlane(
-                        ux=0.0,
-                        uy=0.0,
-                        uz=sign_z,
-                        dot_m=sign_z * z_anchor,
-                        dist=e_len,
-                        flattened=True,
-                    )
-                )
-            else:
-                planes_t.append(
-                    CellHalfPlane(
-                        ux=float(out_n[0]),
-                        uy=float(out_n[1]),
-                        uz=float(out_n[2]),
-                        dot_m=float(np.dot(m, out_n)),
-                        dist=e_len,
-                        flattened=False,
-                    )
-                )
+            hp_t, _ = _clamp_half_plane_overhang(
+                u=out_n,
+                m=m,
+                d=e_len,
+                flatten_deg=flatten_deg,
+                surf_tree=surf_tree,
+                surf_pts=surf_pts,
+            )
+            planes_t.append(hp_t)
 
             ekey = (min(u_idx, v_idx), max(u_idx, v_idx))
             if ekey not in seen_edges:
@@ -771,84 +830,398 @@ def _generate_cubic_3d_seeds(mesh: trimesh.Trimesh, pitch: float) -> Tuple[np.nd
     return seeds, np.asarray(surf_pts, dtype=np.float64)
 
 
-def generate_normal_dendritic_infill(
-    field: VolumetricField, cfg: SlicerConfig
-) -> NormalVoronoiLattice:
-    """
-    Stage 3: Build the 3D cellular seed field and precompute exact 3D bisector half-planes
-    for Hexagonal (regular equal-side flat-top), Voronoi, Square, Diamond (45-deg),
-    Triangular (equilateral iso-grid), Brick, Gyroid (TPMS), or Cubic (54.7-deg tilted 3D).
-
-    When ``field.mesh`` contains multiple disconnected bodies, each body receives its own
-    independent volumetric field and 3D cellular wireframe so no body is skipped or cross-coupled.
-    """
-    bodies = split_mesh_bodies(field.mesh)
-    if len(bodies) > 1:
-        sub_lattices = [
-            _generate_single_body_dendritic_infill(VolumetricField(b, pitch=field.pitch), cfg)
-            for b in bodies
-        ]
-        return combine_lattices(
-            sub_lattices,
-            pattern=cfg.infill.pattern,
-            pitch=max(2.5, cfg.infill.target_cell_pitch),
+def _clamp_half_plane_overhang(
+    u: np.ndarray,
+    m: np.ndarray,
+    d: float,
+    flatten_deg: float,
+    surf_tree: Optional[cKDTree] = None,
+    surf_pts: Optional[np.ndarray] = None,
+    snap_endpoints: Optional[Tuple[float, float]] = None,
+    min_self_support_deg: float = 44.5,
+) -> Tuple[CellHalfPlane, Optional[float]]:
+    """Build a self-supporting ``CellHalfPlane`` by flattening shallow faces or steepening <45° ramps."""
+    tilt_from_horiz_deg = math.degrees(math.acos(min(1.0, abs(float(u[2])))))
+    if flatten_deg > 0.0 and tilt_from_horiz_deg < (flatten_deg - 1e-3):
+        if surf_tree is not None and surf_pts is not None and len(surf_pts) > 0:
+            _, snap_idx = surf_tree.query(m, k=1)
+            z_anchor = float(surf_pts[snap_idx, 2])
+            if snap_endpoints is not None:
+                z_lo_ep, z_hi_ep = min(snap_endpoints), max(snap_endpoints)
+                z_anchor = max(z_lo_ep, min(z_hi_ep, z_anchor))
+        else:
+            z_anchor = float(m[2])
+        sign_z = 1.0 if float(u[2]) >= 0.0 else -1.0
+        return (
+            CellHalfPlane(
+                ux=0.0, uy=0.0, uz=sign_z, dot_m=sign_z * z_anchor, dist=d, flattened=True
+            ),
+            z_anchor,
         )
-    return _generate_single_body_dendritic_infill(field, cfg)
+
+    u_eff = u
+    if min_self_support_deg > flatten_deg and tilt_from_horiz_deg < min_self_support_deg:
+        xy_norm = math.hypot(float(u[0]), float(u[1]))
+        if xy_norm > 1e-6:
+            target_rad = math.radians(min_self_support_deg)
+            new_xy_mag = math.sin(target_rad)
+            new_uz = math.copysign(math.cos(target_rad), float(u[2]))
+            scale_xy = new_xy_mag / xy_norm
+            u_eff = np.array([float(u[0]) * scale_xy, float(u[1]) * scale_xy, new_uz], dtype=np.float64)
+
+    return (
+        CellHalfPlane(
+            ux=float(u_eff[0]),
+            uy=float(u_eff[1]),
+            uz=float(u_eff[2]),
+            dot_m=float(np.dot(m, u_eff)),
+            dist=d,
+            flattened=False,
+        ),
+        None,
+    )
 
 
-def _generate_single_body_dendritic_infill(
-    field: VolumetricField, cfg: SlicerConfig
-) -> NormalVoronoiLattice:
-    """Synthesize the 3D cellular seed field, wireframe, and half-planes for a single connected body."""
-    icfg = cfg.infill
-    pitch = max(2.5, icfg.target_cell_pitch)
-    pattern = icfg.pattern
+def _extract_wireframe_from_surface_tris(
+    verts: np.ndarray,
+    faces: np.ndarray,
+    seeds: np.ndarray,
+    pitch: float,
+    strut_radius: float,
+) -> List[Capsule]:
+    """Extract dual Voronoi cell edge wireframe directly from labeled triangle vertices (zero marching cubes)."""
+    if len(seeds) < 4 or len(verts) == 0 or len(faces) == 0:
+        return []
+    stree = cKDTree(seeds)
+    _, v_labels = stree.query(verts, k=1)
+    tri_lbl = v_labels[faces]
 
-    if pattern == "gyroid":
-        return _build_gyroid_lattice(field, pitch=pitch, strut_radius=icfg.strut_radius)
+    is_corner = (
+        (tri_lbl[:, 0] != tri_lbl[:, 1])
+        & (tri_lbl[:, 1] != tri_lbl[:, 2])
+        & (tri_lbl[:, 0] != tri_lbl[:, 2])
+    )
+    corner_f = np.flatnonzero(is_corner)
+    if len(corner_f) == 0:
+        return []
 
-    if pattern == "cubic":
-        seeds, surf_pts = _generate_cubic_3d_seeds(field.mesh, pitch)
-    else:
-        seeds, surf_pts = _generate_outer_surface_seeds(field.mesh, pattern, pitch)
-    n_surface_seeds = len(seeds)
-    mesh_zmin = float(field.mesh.bounds[0, 2])
-    mesh_zmax = float(field.mesh.bounds[1, 2])
-    flatten_deg = 0.0 if pattern == "cubic" else max(0.0, float(icfg.flatten_angle_deg))
+    node_coords: List[np.ndarray] = []
+    triple_to_nid: Dict[Tuple[int, int, int], int] = {}
+    pair_to_nids: Dict[Tuple[int, int], List[int]] = {}
 
-    # Special dual construction for Equilateral Triangular Iso-Grid cells
-    if pattern == "triangular" and n_surface_seeds >= 3:
-        tri_lat = _build_triangular_dual_lattice(
-            hex_seeds=seeds,
-            surf_pts=surf_pts,
-            pitch=pitch,
-            strut_radius=icfg.strut_radius,
-            flatten_deg=flatten_deg,
-            mesh_zmin=mesh_zmin,
-            mesh_zmax=mesh_zmax,
+    for f_idx in corner_f:
+        triple = tuple(sorted((int(tri_lbl[f_idx, 0]), int(tri_lbl[f_idx, 1]), int(tri_lbl[f_idx, 2]))))
+        c = verts[faces[f_idx]].mean(axis=0)
+        if triple not in triple_to_nid:
+            nid = len(node_coords)
+            triple_to_nid[triple] = nid
+            node_coords.append(c)
+            for pair in ((triple[0], triple[1]), (triple[1], triple[2]), (triple[0], triple[2])):
+                pair_to_nids.setdefault(pair, []).append(nid)
+        else:
+            nid = triple_to_nid[triple]
+            node_coords[nid] = 0.5 * (node_coords[nid] + c)
+
+    nodes_arr = np.asarray(node_coords, dtype=np.float64)
+    capsules: List[Capsule] = []
+    seen = set()
+    max_edge = pitch * 1.45
+
+    def _add_edge(u: int, v: int) -> None:
+        key = (min(u, v), max(u, v))
+        if u != v and key not in seen and np.linalg.norm(nodes_arr[u] - nodes_arr[v]) <= max_edge:
+            seen.add(key)
+            a, b = nodes_arr[u], nodes_arr[v]
+            capsules.append(
+                Capsule(
+                    a=a, b=b, radius=strut_radius, z_min=float(min(a[2], b[2])), z_max=float(max(a[2], b[2]))
+                )
+            )
+
+    for _pair, nids in pair_to_nids.items():
+        if len(nids) == 2:
+            _add_edge(nids[0], nids[1])
+        elif len(nids) > 2:
+            sub = nodes_arr[nids]
+            sub_tree = cKDTree(sub)
+            for i_local, u in enumerate(nids):
+                _, nbrs = sub_tree.query(sub[i_local], k=min(3, len(nids)))
+                for j_local in np.atleast_1d(nbrs)[1:]:
+                    _add_edge(u, nids[int(j_local)])
+
+    return capsules
+
+
+def _build_mesh_surface_wireframe(
+    mesh: trimesh.Trimesh, seeds: np.ndarray, pitch: float, strut_radius: float
+) -> List[Capsule]:
+    """Build 3D cellular wireframe directly on subdivided mesh triangles (zero voxels)."""
+    if len(seeds) < 4 or len(mesh.faces) == 0:
+        return []
+    verts = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    max_edge_target = max(0.9, min(2.2, pitch * 0.24))
+    for _ in range(3):
+        if len(faces) >= 48000:
+            break
+        tri_pts = verts[faces]
+        e_lens = np.maximum(
+            np.linalg.norm(tri_pts[:, 1] - tri_pts[:, 0], axis=1),
+            np.maximum(
+                np.linalg.norm(tri_pts[:, 2] - tri_pts[:, 1], axis=1),
+                np.linalg.norm(tri_pts[:, 0] - tri_pts[:, 2], axis=1),
+            ),
         )
-        if len(tri_lat.seeds) > 0:
-            tri_lat.pattern = pattern
-            tri_lat.pitch = pitch
-            return tri_lat
+        if float(e_lens.max()) <= max_edge_target:
+            break
+        verts, faces = trimesh.remesh.subdivide(verts, faces)
+    return _extract_wireframe_from_surface_tris(verts, faces, seeds, pitch, strut_radius)
 
-    # Optional deep isotropic 3D core seeds in full_to_medial mode when max_normal_depth is set
-    if icfg.mode == "full_to_medial" and icfg.max_normal_depth is not None and pattern != "cubic":
-        outer_shell = cfg.fff.perimeters * cfg.fff.line_width
-        core_depth = outer_shell + icfg.max_normal_depth
-        core_idx = np.argwhere(field.vol & (field.dist_in >= core_depth))
-        if len(core_idx) > 0:
-            core_pts = field.origin + core_idx * field.pitch
-            core_arr = _poisson_disk_sample(core_pts, min_radius=pitch * 0.85, seed=7)
-            if len(core_arr) > 0:
-                seeds = np.vstack([seeds, core_arr]) if len(seeds) > 0 else core_arr
 
+def _sample_surface_from_slices(mesh: trimesh.Trimesh, pitch: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract dense 3D surface boundary points + normals from exact XY mesh slices (zero Monte Carlo sampling)."""
+    tri_verts = np.asarray(mesh.triangles, dtype=np.float64)
+    tri_zmin = tri_verts[:, :, 2].min(axis=1)
+    tri_zmax = tri_verts[:, :, 2].max(axis=1)
+    bmin, bmax = mesh.bounds
+    z0, z1 = float(bmin[2]), float(bmax[2])
+    span_z = max(1e-3, z1 - z0)
+    n_z = max(8, min(32, int(math.ceil(span_z / max(0.8, pitch * 0.28)))))
+    zs = np.linspace(z0 + 0.03 * span_z, z1 - 0.03 * span_z, n_z)
+    step_xy = max(0.45, min(1.4, pitch * 0.16))
+
+    pts_chunks: List[np.ndarray] = []
+    norm_chunks: List[np.ndarray] = []
+
+    def _sample_ring(coords: np.ndarray, z_val: float, n_xy_sign: float) -> None:
+        if len(coords) < 2:
+            return
+        diffs = np.diff(coords, axis=0)
+        lens = np.hypot(diffs[:, 0], diffs[:, 1])
+        tot = float(lens.sum())
+        if tot < 1e-4:
+            return
+        n_pts = max(4, min(240, int(math.ceil(tot / step_xy))))
+        cum = np.concatenate([[0.0], np.cumsum(lens)])
+        s_t = np.linspace(0.0, tot, n_pts, endpoint=False)
+        px = np.interp(s_t, cum, coords[:, 0])
+        py = np.interp(s_t, cum, coords[:, 1])
+        pz = np.full(n_pts, z_val, dtype=np.float64)
+        pts_chunks.append(np.column_stack([px, py, pz]))
+        p_prev = np.roll(np.column_stack([px, py]), 1, axis=0)
+        p_next = np.roll(np.column_stack([px, py]), -1, axis=0)
+        tang = p_next - p_prev
+        t_len = np.maximum(np.linalg.norm(tang, axis=1, keepdims=True), 1e-9)
+        tang = tang / t_len
+        n_arr = np.column_stack([n_xy_sign * tang[:, 1], -n_xy_sign * tang[:, 0], np.zeros(n_pts)])
+        norm_chunks.append(n_arr)
+
+    for zv in zs:
+        poly = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, float(zv)))
+        if poly.is_empty:
+            continue
+        geoms = list(poly.geoms) if hasattr(poly, "geoms") else [poly]
+        for g in geoms:
+            if not hasattr(g, "exterior") or g.area < 0.05:
+                continue
+            _sample_ring(np.asarray(g.exterior.coords, dtype=np.float64), float(zv), 1.0)
+            for interior in g.interiors:
+                _sample_ring(np.asarray(interior.coords, dtype=np.float64), float(zv), -1.0)
+
+    if not pts_chunks:
+        pts, f_idx = trimesh.sample.sample_surface(mesh, count=4000)
+        return np.asarray(pts, dtype=np.float64), np.asarray(mesh.face_normals[f_idx], dtype=np.float64)
+    return np.vstack(pts_chunks), np.vstack(norm_chunks)
+
+
+def _generate_analytic_seeds(
+    mesh: trimesh.Trimesh, pattern: str, pitch: float
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Closed-form analytical 3D lattice seeds snapped to slice boundaries (zero CVT/spring/voxels)."""
+    surf_pts, surf_normals = _sample_surface_from_slices(mesh, pitch)
+    if len(surf_pts) == 0:
+        return np.zeros((0, 3), dtype=np.float64), surf_pts
+    pt_tree = cKDTree(surf_pts)
+    base_pattern = "hexagonal" if pattern == "triangular" else pattern
+
+    wall_seeds = _generate_developable_or_wall_seeds(mesh, surf_pts, pt_tree, base_pattern, pitch)
+    if wall_seeds is not None and len(wall_seeds) >= 4:
+        return wall_seeds, surf_pts
+
+    seeds = _generate_triplanar_lattice_seeds(
+        mesh, surf_pts, surf_normals, pt_tree, "hexagonal" if base_pattern == "voronoi" else base_pattern, pitch
+    )
+    if base_pattern == "voronoi" and len(seeds) > 4:
+        rng = np.random.default_rng(42)
+        jitter = rng.uniform(-0.18 * pitch, 0.18 * pitch, size=seeds.shape)
+        _, snap = pt_tree.query(seeds + jitter, k=1)
+        seeds = surf_pts[snap]
+    return seeds, surf_pts
+
+
+def _filter_interior_seeds_analytic(
+    mesh: trimesh.Trimesh, core_depth: float, pitch: float
+) -> np.ndarray:
+    """Place deep-core seeds analytically via eroded XY Z-slices without building a 3D SDF."""
+    bmin, bmax = mesh.bounds
+    tri_verts = np.asarray(mesh.triangles, dtype=np.float64)
+    tri_zmin = tri_verts[:, :, 2].min(axis=1)
+    tri_zmax = tri_verts[:, :, 2].max(axis=1)
+    z0, z1 = float(bmin[2]) + core_depth, float(bmax[2]) - core_depth
+    if z1 <= z0:
+        return np.zeros((0, 3), dtype=np.float64)
+
+    zs = np.arange(z0, z1 + 1e-6, max(1.0, pitch * 0.85))
+    chunks: List[np.ndarray] = []
+    for zv in zs:
+        p = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, float(zv)))
+        if p.is_empty:
+            continue
+        eroded = safe_buffer(p, -core_depth, join_style=1)
+        if eroded.is_empty or eroded.area < 0.25:
+            continue
+        ex0, ey0, ex1, ey1 = eroded.bounds
+        xs = np.arange(ex0, ex1 + pitch * 0.85, pitch * 0.85)
+        ys = np.arange(ey0, ey1 + pitch * 0.85, pitch * 0.85)
+        if len(xs) == 0 or len(ys) == 0:
+            continue
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+        cand_x, cand_y = gx.ravel(), gy.ravel()
+        inside = shapely.contains_xy(eroded, cand_x, cand_y)
+        if np.any(inside):
+            n_in = int(np.count_nonzero(inside))
+            chunks.append(np.column_stack([cand_x[inside], cand_y[inside], np.full(n_in, float(zv))]))
+    return np.vstack(chunks) if chunks else np.zeros((0, 3), dtype=np.float64)
+
+
+def _build_gyroid_lattice_mesh(
+    mesh: trimesh.Trimesh, pitch: float, strut_radius: float
+) -> NormalVoronoiLattice:
+    """Build 3D Gyroid TPMS wireframe using exact planar XY slices instead of voxel SDF lookups."""
+    k = 2.0 * math.pi / max(3.0, pitch)
+    bounds = mesh.bounds
+    z0, z1 = float(bounds[0, 2]), float(bounds[1, 2])
+    x0, x1 = float(bounds[0, 0]), float(bounds[1, 0])
+    y0, y1 = float(bounds[0, 1]), float(bounds[1, 1])
+
+    tri_verts = np.asarray(mesh.triangles, dtype=np.float64)
+    tri_zmin = tri_verts[:, :, 2].min(axis=1)
+    tri_zmax = tri_verts[:, :, 2].max(axis=1)
+
+    step_xy = max(0.65, pitch / 14.0)
+    xs = np.arange(x0, x1 + step_xy, step_xy)
+    ys = np.arange(y0, y1 + step_xy, step_xy)
+    capsules: List[Capsule] = []
+    seeds_list: List[np.ndarray] = []
+
+    if len(xs) >= 3 and len(ys) >= 3:
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+        n_slices = max(4, min(14, int(round((z1 - z0) / max(1.5, pitch * 0.28)))))
+        zs = np.linspace(z0 + 0.8, max(z0 + 0.9, z1 - 0.8), n_slices)
+        sx, cx = np.sin(k * gx), np.cos(k * gx)
+        sy, cy = np.sin(k * gy), np.cos(k * gy)
+
+        for zv in zs:
+            slice_poly = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, float(zv)))
+            if slice_poly.is_empty:
+                continue
+            sz, cz = math.sin(k * zv), math.cos(k * zv)
+            val = sx * cy + sy * cz + sz * cx
+            contours = measure.find_contours(val, 0.0)
+            for c in contours:
+                if len(c) < 2:
+                    continue
+                px = x0 + c[:, 0] * step_xy
+                py = y0 + c[:, 1] * step_xy
+                inside = shapely.contains_xy(slice_poly, px, py)
+                for m in range(len(px) - 1):
+                    if inside[m] and inside[m + 1]:
+                        pa = np.array([px[m], py[m], zv], dtype=np.float64)
+                        pb = np.array([px[m + 1], py[m + 1], zv], dtype=np.float64)
+                        capsules.append(Capsule(a=pa, b=pb, radius=strut_radius, z_min=zv, z_max=zv))
+                        if m % 6 == 0:
+                            seeds_list.append(pa)
+
+    seeds = np.asarray(seeds_list, dtype=np.float64) if seeds_list else np.zeros((0, 3), dtype=np.float64)
+    return NormalVoronoiLattice(
+        capsules=capsules,
+        seeds=seeds,
+        cell_planes=[],
+        seed_z_bounds=np.zeros((len(seeds), 2), dtype=np.float64),
+        pattern="gyroid",
+        pitch=pitch,
+        generator="mesh_direct",
+    )
+
+
+def _build_planar_25d_lattice(
+    mesh: trimesh.Trimesh, pitch: float, strut_radius: float, pattern: str
+) -> NormalVoronoiLattice:
+    """Ultra-fast 2.5D Layer-Direct formwork descriptor + lightweight Z-slice 3D wireframe preview."""
+    bounds = mesh.bounds
+    z0, z1 = float(bounds[0, 2]), float(bounds[1, 2])
+    tri_verts = np.asarray(mesh.triangles, dtype=np.float64)
+    tri_zmin = tri_verts[:, :, 2].min(axis=1)
+    tri_zmax = tri_verts[:, :, 2].max(axis=1)
+
+    n_slices = max(3, min(10, int(round((z1 - z0) / max(1.5, pitch * 0.45)))))
+    zs = np.linspace(z0 + 0.5, max(z0 + 0.6, z1 - 0.5), n_slices)
+    sp = max(2.5, pitch)
+    capsules: List[Capsule] = []
+    seeds_list: List[np.ndarray] = []
+
+    for zv in zs:
+        poly = clean_geom(_slice_mesh_plane_exact(tri_verts, tri_zmin, tri_zmax, float(zv)))
+        if poly.is_empty:
+            continue
+        bx0, by0, bx1, by1 = poly.bounds
+        phase = 0.55 * float(zv)
+        raw_segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+        xv = math.floor((bx0 - phase) / sp) * sp + phase
+        while xv <= bx1 + sp:
+            raw_segs.append(((xv, by0 - 1.0), (xv, by1 + 1.0)))
+            xv += sp
+        yv = math.floor((by0 + 0.5 * phase) / sp) * sp - 0.5 * phase
+        while yv <= by1 + sp:
+            raw_segs.append(((bx0 - 1.0, yv), (bx1 + 1.0, yv)))
+            yv += sp
+        if raw_segs:
+            inter = shapely.intersection(poly, shapely.multilinestrings(raw_segs))
+            for coords in extract_polylines(inter):
+                for m in range(len(coords) - 1):
+                    pa = np.array([coords[m, 0], coords[m, 1], float(zv)], dtype=np.float64)
+                    pb = np.array([coords[m + 1, 0], coords[m + 1, 1], float(zv)], dtype=np.float64)
+                    capsules.append(Capsule(a=pa, b=pb, radius=strut_radius, z_min=float(zv), z_max=float(zv)))
+                    if m == 0:
+                        seeds_list.append(pa)
+
+    seeds = np.asarray(seeds_list, dtype=np.float64) if seeds_list else np.zeros((0, 3), dtype=np.float64)
+    return NormalVoronoiLattice(
+        capsules=capsules,
+        seeds=seeds,
+        cell_planes=[],
+        seed_z_bounds=np.zeros((len(seeds), 2), dtype=np.float64),
+        pattern=pattern,
+        pitch=pitch,
+        generator="planar_25d",
+    )
+
+
+def _build_half_planes_for_seeds(
+    seeds: np.ndarray,
+    surf_pts: np.ndarray,
+    n_surface_seeds: int,
+    pitch: float,
+    flatten_deg: float,
+    mesh_zmin: float,
+    mesh_zmax: float,
+) -> Tuple[List[List[CellHalfPlane]], np.ndarray]:
+    """Compute self-supporting neighbor bisector half-planes for ``seeds``."""
     n_seeds = len(seeds)
     if n_seeds == 0:
-        return NormalVoronoiLattice([], seeds, [], np.zeros((0, 2)), pattern=pattern, pitch=pitch)
+        return [], np.zeros((0, 2), dtype=np.float64)
 
     surf_tree = cKDTree(surf_pts) if len(surf_pts) > 0 else None
-
     k_nbrs = min(n_seeds, 28)
     tree = cKDTree(seeds)
     dists, nbr_indices = tree.query(seeds, k=k_nbrs)
@@ -877,55 +1250,167 @@ def _generate_single_body_dendritic_infill(
             u = (sj - si) / d
             m = 0.5 * (si + sj)
 
-            # Angle of the bisector plane relative to horizontal XY plane (0 deg = flat, 90 deg = vertical)
-            tilt_from_horiz_deg = math.degrees(math.acos(min(1.0, abs(float(u[2])))))
-
-            if flatten_deg > 0.0 and tilt_from_horiz_deg < (flatten_deg - 1e-3):
-                if surf_tree is not None and i < n_surface_seeds and j < n_surface_seeds:
-                    _, snap_idx = surf_tree.query(m, k=1)
-                    z_anchor = float(surf_pts[snap_idx, 2])
-                    z_anchor = max(
-                        min(float(si[2]), float(sj[2])),
-                        min(max(float(si[2]), float(sj[2])), z_anchor),
-                    )
-                else:
-                    z_anchor = float(m[2])
-
-                sign_z = 1.0 if u[2] >= 0.0 else -1.0
-                planes_i.append(
-                    CellHalfPlane(
-                        ux=0.0,
-                        uy=0.0,
-                        uz=sign_z,
-                        dot_m=sign_z * z_anchor,
-                        dist=d,
-                        flattened=True,
-                    )
-                )
-                z_lo = min(z_lo, z_anchor - 1.0)
-                z_hi = max(z_hi, z_anchor + 1.0)
-            else:
-                dot_m = float(np.dot(m, u))
-                planes_i.append(
-                    CellHalfPlane(
-                        ux=float(u[0]),
-                        uy=float(u[1]),
-                        uz=float(u[2]),
-                        dot_m=dot_m,
-                        dist=d,
-                        flattened=False,
-                    )
-                )
-
+            use_surf = (surf_tree is not None) and (i < n_surface_seeds) and (j < n_surface_seeds)
+            hp, z_anch = _clamp_half_plane_overhang(
+                u=u,
+                m=m,
+                d=d,
+                flatten_deg=flatten_deg,
+                surf_tree=surf_tree if use_surf else None,
+                surf_pts=surf_pts if use_surf else None,
+                snap_endpoints=(float(si[2]), float(sj[2])),
+            )
+            planes_i.append(hp)
+            if z_anch is not None:
+                z_lo = min(z_lo, z_anch - 1.0)
+                z_hi = max(z_hi, z_anch + 1.0)
             if slot <= 8:
                 max_r = max(max_r, d * 0.95)
 
-        planes_i.sort(key=lambda hp: (0 if hp.flattened else 1, -abs(hp.uz), hp.dist))
+        planes_i.sort(key=lambda h: (0 if h.flattened else 1, -abs(h.uz), h.dist))
         cell_planes.append(planes_i)
         z_bounds[i, 0] = max(mesh_zmin - 1.0, min(z_lo, si[2] - max_r))
         z_bounds[i, 1] = min(mesh_zmax + 1.0, max(z_hi, si[2] + max_r))
 
-    capsules = _build_voronoi_surface_wireframe(
-        field, seeds[:n_surface_seeds], pitch, icfg.strut_radius
+    return cell_planes, z_bounds
+
+
+def generate_cellular_infill_for_mesh(
+    mesh: trimesh.Trimesh,
+    cfg: SlicerConfig,
+    field: Optional[VolumetricField] = None,
+) -> NormalVoronoiLattice:
+    """
+    Generate 3D cellular formwork for ``mesh`` using the configured ``infill.slicing_generator``:
+      - ``mesh_direct``: Direct triangle surface seeding & wireframe (no voxels)
+      - ``analytic_hex``: Closed-form analytical 3D lattice from XY slices (no voxels, fastest 3D)
+      - ``planar_25d``: Ultra-fast 2.5D layer-direct self-supporting ribs & channels (no voxels)
+      - ``voxel_sdf``: Legacy 3D SDF field + marching-cubes wireframe
+    """
+    gen = str(getattr(cfg.infill, "slicing_generator", "mesh_direct")).lower()
+    bodies = split_mesh_bodies(mesh)
+    if len(bodies) > 1:
+        sub_lattices = [
+            _generate_single_body_dendritic_infill(
+                VolumetricField(b, pitch=cfg.voxel_pitch_mm) if gen == "voxel_sdf" else b,
+                cfg,
+            )
+            for b in bodies
+        ]
+        return combine_lattices(
+            sub_lattices,
+            pattern=cfg.infill.pattern,
+            pitch=max(2.5, cfg.infill.target_cell_pitch),
+        )
+    src = field if (field is not None and gen == "voxel_sdf") else mesh
+    return _generate_single_body_dendritic_infill(src, cfg)
+
+
+def generate_normal_dendritic_infill(
+    field: VolumetricField, cfg: SlicerConfig
+) -> NormalVoronoiLattice:
+    """
+    Stage 3: Build the cellular lattice via ``infill.slicing_generator`` (accepting a ``VolumetricField``
+    for backwards compatibility with existing callers and tests).
+    """
+    gen = str(getattr(cfg.infill, "slicing_generator", "mesh_direct")).lower()
+    if gen == "voxel_sdf":
+        bodies = split_mesh_bodies(field.mesh)
+        if len(bodies) > 1:
+            sub = [_generate_single_body_dendritic_infill(VolumetricField(b, pitch=field.pitch), cfg) for b in bodies]
+            return combine_lattices(sub, pattern=cfg.infill.pattern, pitch=max(2.5, cfg.infill.target_cell_pitch))
+        return _generate_single_body_dendritic_infill(field, cfg)
+    return generate_cellular_infill_for_mesh(field.mesh, cfg, field=field)
+
+
+def _generate_single_body_dendritic_infill(
+    source: Union[VolumetricField, trimesh.Trimesh], cfg: SlicerConfig
+) -> NormalVoronoiLattice:
+    """Synthesize the 3D cellular seed field, wireframe, and half-planes for a single connected body."""
+    is_field = isinstance(source, VolumetricField)
+    mesh = source.mesh if is_field else source
+    field = source if is_field else None
+
+    icfg = cfg.infill
+    pitch = max(2.5, icfg.target_cell_pitch)
+    pattern = icfg.pattern
+    gen = str(getattr(icfg, "slicing_generator", "mesh_direct")).lower()
+
+    if gen == "planar_25d" and pattern != "gyroid":
+        return _build_planar_25d_lattice(mesh, pitch=pitch, strut_radius=icfg.strut_radius, pattern=pattern)
+
+    if pattern == "gyroid":
+        if field is not None and gen == "voxel_sdf":
+            return _build_gyroid_lattice(field, pitch=pitch, strut_radius=icfg.strut_radius)
+        return _build_gyroid_lattice_mesh(mesh, pitch=pitch, strut_radius=icfg.strut_radius)
+
+    if pattern == "cubic":
+        seeds, surf_pts = _generate_cubic_3d_seeds(mesh, pitch)
+    elif gen == "analytic_hex":
+        seeds, surf_pts = _generate_analytic_seeds(mesh, pattern, pitch)
+    elif gen == "mesh_direct":
+        n_samp = min(12000, max(6000, len(mesh.faces) * 4))
+        seeds, surf_pts = _generate_outer_surface_seeds(mesh, pattern, pitch, sample_count=n_samp)
+    else:
+        seeds, surf_pts = _generate_outer_surface_seeds(mesh, pattern, pitch)
+
+    n_surface_seeds = len(seeds)
+    mesh_zmin = float(mesh.bounds[0, 2])
+    mesh_zmax = float(mesh.bounds[1, 2])
+    flatten_deg = 0.0 if pattern == "cubic" else max(0.0, float(icfg.flatten_angle_deg))
+
+    # Special dual construction for Equilateral Triangular Iso-Grid cells
+    if pattern == "triangular" and n_surface_seeds >= 3:
+        tri_lat = _build_triangular_dual_lattice(
+            hex_seeds=seeds,
+            surf_pts=surf_pts,
+            pitch=pitch,
+            strut_radius=icfg.strut_radius,
+            flatten_deg=flatten_deg,
+            mesh_zmin=mesh_zmin,
+            mesh_zmax=mesh_zmax,
+        )
+        if len(tri_lat.seeds) > 0:
+            tri_lat.pattern = pattern
+            tri_lat.pitch = pitch
+            tri_lat.generator = gen
+            return tri_lat
+
+    # Optional deep isotropic 3D core seeds in full_to_medial mode when max_normal_depth is set
+    if icfg.mode == "full_to_medial" and icfg.max_normal_depth is not None and pattern != "cubic":
+        outer_shell = cfg.fff.perimeters * cfg.fff.line_width
+        core_depth = outer_shell + icfg.max_normal_depth
+        if field is not None and gen == "voxel_sdf":
+            core_idx = np.argwhere(field.vol & (field.dist_in >= core_depth))
+            core_pts = (field.origin + core_idx * field.pitch) if len(core_idx) > 0 else np.zeros((0, 3))
+            core_arr = _poisson_disk_sample(core_pts, min_radius=pitch * 0.85, seed=7)
+        else:
+            core_arr = _filter_interior_seeds_analytic(mesh, core_depth=core_depth, pitch=pitch)
+        if len(core_arr) > 0:
+            seeds = np.vstack([seeds, core_arr]) if len(seeds) > 0 else core_arr
+
+    n_seeds = len(seeds)
+    if n_seeds == 0:
+        return NormalVoronoiLattice([], seeds, [], np.zeros((0, 2)), pattern=pattern, pitch=pitch, generator=gen)
+
+    cell_planes, z_bounds = _build_half_planes_for_seeds(
+        seeds=seeds,
+        surf_pts=surf_pts,
+        n_surface_seeds=n_surface_seeds,
+        pitch=pitch,
+        flatten_deg=flatten_deg,
+        mesh_zmin=mesh_zmin,
+        mesh_zmax=mesh_zmax,
     )
-    return NormalVoronoiLattice(capsules, seeds, cell_planes, z_bounds, pattern=pattern, pitch=pitch)
+
+    if field is not None and gen == "voxel_sdf":
+        capsules = _build_voronoi_surface_wireframe(
+            field, seeds[:n_surface_seeds], pitch, icfg.strut_radius
+        )
+    else:
+        capsules = _build_mesh_surface_wireframe(
+            mesh, seeds[:n_surface_seeds], pitch, icfg.strut_radius
+        )
+    return NormalVoronoiLattice(
+        capsules, seeds, cell_planes, z_bounds, pattern=pattern, pitch=pitch, generator=gen
+    )

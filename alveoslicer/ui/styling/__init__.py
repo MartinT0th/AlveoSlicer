@@ -12,6 +12,7 @@ from .theme import (
     BORDER_SUBTLE,
     DARK_PALETTE,
     DARK_STYLESHEET,
+    EXPERIENCE_MODES,
     LIGHT_PALETTE,
     LIGHT_STYLESHEET,
     TEXT_MUTED,
@@ -21,14 +22,17 @@ from .theme import (
     build_stylesheet,
     detect_system_theme,
     get_palette,
+    load_experience_mode,
     load_theme_preference,
     resolve_theme_mode,
+    save_experience_mode,
     save_theme_preference,
 )
 from .widgets import make_double_spin, make_spin, wrap_scroll
 
 __all__ = [
     "THEME_MODES",
+    "EXPERIENCE_MODES",
     "ThemePalette",
     "DARK_PALETTE",
     "LIGHT_PALETTE",
@@ -47,7 +51,9 @@ __all__ = [
     "detect_system_theme",
     "resolve_theme_mode",
     "get_palette",
+    "load_experience_mode",
     "load_theme_preference",
+    "save_experience_mode",
     "save_theme_preference",
     "build_stylesheet",
     "clear_icon_cache",

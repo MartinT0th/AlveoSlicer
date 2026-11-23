@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -28,7 +28,7 @@ FEATURE_TYPE_TO_ID: Dict[str, int] = {name: idx for idx, name in enumerate(FEATU
 
 # Slick AlveoSlicer yellow-accented PrusaSlicer-inspired palette
 FEATURE_COLORS: Dict[str, Tuple[float, float, float]] = {
-    "External perimeter": (0.96, 0.77, 0.09),          # Vivid AlveoSlicer yellow
+    "External perimeter": (0.961, 0.722, 0.180),       # Warm AlveoSlicer amber-gold (#f5b82e)
     "Perimeter": (0.92, 0.58, 0.16),                   # Warm gold-amber
     "Internal infill": (0.93, 0.33, 0.31),             # Coral red (inside perimeters)
     "Solid infill": (0.69, 0.36, 0.85),                # Violet (solid skins & flat cell caps)
@@ -136,12 +136,21 @@ def parse_gcode(gcode_text: str) -> GCodePreviewData:
     est_time_str = ""
     in_custom_block = True
 
+    ext_p0_app, ext_p1_app = ext_p0.append, ext_p1.append
+    ext_w_app, ext_h_app = ext_w.append, ext_h.append
+    ext_t_app, ext_l_app, ext_m_app = ext_t.append, ext_l.append, ext_m.append
+    trv_p0_app, trv_p1_app = trv_p0.append, trv_p1.append
+    trv_l_app, trv_m_app = trv_l.append, trv_m.append
+    type_get = FEATURE_TYPE_TO_ID.get
+    default_type_id = FEATURE_TYPE_TO_ID["Internal infill"]
+
     for raw_line in gcode_text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
 
-        if line.startswith(";"):
+        c0 = line[0]
+        if c0 == ";":
             if line == ";LAYER_CHANGE":
                 if cur_layer > 0:
                     layer_move_counts.append(move_in_layer)
@@ -151,24 +160,24 @@ def parse_gcode(gcode_text: str) -> GCodePreviewData:
                 layer_zs.append(cur_z)
             elif line.startswith(";Z:"):
                 try:
-                    cur_z = float(line[3:].strip())
+                    cur_z = float(line[3:])
                     if layer_zs:
                         layer_zs[-1] = cur_z
                 except ValueError:
                     pass
             elif line.startswith(";HEIGHT:"):
                 try:
-                    cur_height = float(line[8:].strip())
+                    cur_height = float(line[8:])
                 except ValueError:
                     pass
             elif line.startswith(";WIDTH:"):
                 try:
-                    cur_width = float(line[7:].strip())
+                    cur_width = float(line[7:])
                 except ValueError:
                     pass
             elif line.startswith(";TYPE:"):
                 tname = line[6:].strip()
-                cur_type_id = FEATURE_TYPE_TO_ID.get(tname, FEATURE_TYPE_TO_ID["Internal infill"])
+                cur_type_id = type_get(tname, default_type_id)
                 in_custom_block = tname == "Custom"
             elif "PHOTOPOLYMER INJECT & UV CURE" in line or "COREXY TOOLCHANGER INJECT & UV CURE" in line:
                 if cur_layer > 0:
@@ -187,86 +196,92 @@ def parse_gcode(gcode_text: str) -> GCodePreviewData:
                     )
             elif line.startswith("; photopolymer used [mL] ="):
                 try:
-                    total_resin_ml = float(line.split("=", 1)[1].strip())
+                    total_resin_ml = float(line.split("=", 1)[1])
                 except ValueError:
                     pass
             elif line.startswith("; estimated printing time (normal mode) ="):
                 est_time_str = line.split("=", 1)[1].strip()
             continue
 
-        # Strip inline comment
-        cmd_part = line.split(";", 1)[0].strip()
-        if not cmd_part:
-            continue
+        # Fast-path: most motion lines have no inline comment
+        if ";" in line:
+            line = line.split(";", 1)[0].strip()
+            if not line:
+                continue
 
-        tokens = cmd_part.split()
-        head = tokens[0].upper()
+        tokens = line.split()
+        head = tokens[0]
 
-        if head == "M83":
-            relative_e = True
-            continue
-        if head == "M82":
-            relative_e = False
-            continue
-        if head == "G92":
+        if head == "G1" or head == "G0" or head == "g1" or head == "g0":
+            nx, ny, nz = cur_x, cur_y, cur_z
+            de = 0.0
+            has_xy = False
             for tok in tokens[1:]:
-                if tok.upper().startswith("E"):
+                axis = tok[0]
+                if axis == "X" or axis == "x":
+                    try:
+                        nx = float(tok[1:])
+                        has_xy = True
+                    except ValueError:
+                        pass
+                elif axis == "Y" or axis == "y":
+                    try:
+                        ny = float(tok[1:])
+                        has_xy = True
+                    except ValueError:
+                        pass
+                elif axis == "E" or axis == "e":
+                    try:
+                        val = float(tok[1:])
+                        if relative_e:
+                            de = val
+                            cur_e += val
+                        else:
+                            de = val - cur_e
+                            cur_e = val
+                    except ValueError:
+                        pass
+                elif axis == "Z" or axis == "z":
+                    try:
+                        nz = float(tok[1:])
+                    except ValueError:
+                        pass
+
+            if cur_layer > 0 and active_tool == 0 and not in_custom_block:
+                if has_xy and de > 1e-6:
+                    move_in_layer += 1
+                    ext_p0_app((cur_x, cur_y, cur_z))
+                    ext_p1_app((nx, ny, nz))
+                    ext_w_app(cur_width)
+                    ext_h_app(cur_height)
+                    ext_t_app(cur_type_id)
+                    ext_l_app(cur_layer)
+                    ext_m_app(move_in_layer)
+                    total_filament_mm += de
+                elif has_xy and (abs(nx - cur_x) > 1e-4 or abs(ny - cur_y) > 1e-4):
+                    move_in_layer += 1
+                    trv_p0_app((cur_x, cur_y, cur_z))
+                    trv_p1_app((nx, ny, nz))
+                    trv_l_app(cur_layer)
+                    trv_m_app(move_in_layer)
+
+            cur_x, cur_y, cur_z = nx, ny, nz
+            continue
+
+        head_u = head.upper()
+        if head_u == "M83":
+            relative_e = True
+        elif head_u == "M82":
+            relative_e = False
+        elif head_u == "G92":
+            for tok in tokens[1:]:
+                if tok[0] in ("E", "e"):
                     try:
                         cur_e = float(tok[1:])
                     except ValueError:
                         pass
-            continue
-        if head.startswith("T") and len(head) >= 2 and head[1:].isdigit():
-            active_tool = int(head[1:])
-            continue
-
-        if head not in ("G0", "G1"):
-            continue
-
-        nx, ny, nz = cur_x, cur_y, cur_z
-        de = 0.0
-        has_xy = False
-        for tok in tokens[1:]:
-            axis = tok[0].upper()
-            try:
-                val = float(tok[1:])
-            except ValueError:
-                continue
-            if axis == "X":
-                nx = val
-                has_xy = True
-            elif axis == "Y":
-                ny = val
-                has_xy = True
-            elif axis == "Z":
-                nz = val
-            elif axis == "E":
-                if relative_e:
-                    de = val
-                    cur_e += val
-                else:
-                    de = val - cur_e
-                    cur_e = val
-
-        if cur_layer > 0 and active_tool == 0 and not in_custom_block:
-            if has_xy and de > 1e-6:
-                move_in_layer += 1
-                ext_p0.append((cur_x, cur_y, cur_z))
-                ext_p1.append((nx, ny, nz))
-                ext_w.append(cur_width)
-                ext_h.append(cur_height)
-                ext_t.append(cur_type_id)
-                ext_l.append(cur_layer)
-                ext_m.append(move_in_layer)
-                total_filament_mm += de
-            elif has_xy and (abs(nx - cur_x) > 1e-4 or abs(ny - cur_y) > 1e-4):
-                move_in_layer += 1
-                trv_p0.append((cur_x, cur_y, cur_z))
-                trv_p1.append((nx, ny, nz))
-                trv_l.append(cur_layer)
-                trv_m.append(move_in_layer)
-
-        cur_x, cur_y, cur_z = nx, ny, nz
+        elif head_u.startswith("T") and len(head_u) >= 2 and head_u[1:].isdigit():
+            active_tool = int(head_u[1:])
 
     if cur_layer > 0:
         layer_move_counts.append(move_in_layer)

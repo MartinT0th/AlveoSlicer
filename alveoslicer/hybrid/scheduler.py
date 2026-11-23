@@ -29,43 +29,45 @@ _CONN_2D_8 = np.ones((3, 3), dtype=np.int32)
 _CONN_3D_26 = np.ones((3, 3, 3), dtype=np.int32)
 
 
+def _top_slice_2d_accessible(
+    top_void: np.ndarray, top_acc: np.ndarray, ghost_min_px: int = 2
+) -> bool:
+    """Fast 2D check: True if every non-ghost 8-connected top void island has needle access."""
+    if not np.any(top_void):
+        return True
+    lbl_2d, n_2d = ndimage.label(top_void, structure=_CONN_2D_8)
+    if n_2d == 0:
+        return True
+    counts = np.bincount(lbl_2d.ravel(), minlength=n_2d + 1)
+    acc_counts = np.bincount(lbl_2d[top_acc], minlength=n_2d + 1)
+    return not bool(np.any((counts[1:] > ghost_min_px) & (acc_counts[1:] == 0)))
+
+
 def _slab_3d_needle_accessible(
     layers: List[SlicedLayer],
     start_idx0: int,
     end_idx0: int,
     ghost_min_px: int = 2,
+    top_2d_ok: bool | None = None,
 ) -> bool:
     """
     Verify every non-ghost 3D connected resin basin in [start_idx0..end_idx0]
     has needle access on the top slice.
     """
-    top_void = layers[end_idx0].void_mask
     top_acc = layers[end_idx0].accessible_mask
-    if not np.any(top_void):
-        return True
-
-    lbl_2d, n_2d = ndimage.label(top_void, structure=_CONN_2D_8)
-    all_2d_ok = True
-    for i in range(1, n_2d + 1):
-        m = lbl_2d == i
-        if int(np.count_nonzero(m)) <= ghost_min_px:
-            continue
-        if not np.any(top_acc[m]):
-            all_2d_ok = False
-            break
-    if all_2d_ok:
+    if top_2d_ok is None:
+        top_2d_ok = _top_slice_2d_accessible(layers[end_idx0].void_mask, top_acc, ghost_min_px)
+    if top_2d_ok:
         return True
 
     slab = np.stack([layers[i].void_mask for i in range(start_idx0, end_idx0 + 1)], axis=0)
     lbl_3d, n_3d = ndimage.label(slab, structure=_CONN_3D_26)
+    if n_3d == 0:
+        return True
     top_slice_lbl = lbl_3d[-1]
-    for cid in range(1, n_3d + 1):
-        top_c = top_slice_lbl == cid
-        if int(np.count_nonzero(top_c)) <= ghost_min_px:
-            continue
-        if not np.any(top_acc[top_c]):
-            return False
-    return True
+    counts = np.bincount(top_slice_lbl.ravel(), minlength=n_3d + 1)
+    acc_counts = np.bincount(top_slice_lbl[top_acc], minlength=n_3d + 1)
+    return not bool(np.any((counts[1:] > ghost_min_px) & (acc_counts[1:] == 0)))
 
 
 def compute_optimal_cure_schedule(
@@ -122,6 +124,7 @@ def compute_optimal_cure_schedule(
         air_vent_reach = ly_k.void_mask.copy()
         cum_shadow_px = 0
         cum_void_px = void_counts[k - 1]
+        top_2d_ok = _top_slice_2d_accessible(ly_k.void_mask, ly_k.accessible_mask, ghost_min_px)
 
         p_min = max(0, k - x_max_eff)
         for p in range(k - 1, p_min - 1, -1):
@@ -133,11 +136,12 @@ def compute_optimal_cure_schedule(
                 solid_above |= layers[j_idx0 + 1].solid_mask
 
                 # Airlock-free monotonic buoyancy check (8-connected, immune to single-pixel raster ghosts)
-                vent_seeds = layers[j_idx0].void_mask & air_vent_reach
+                j_void = layers[j_idx0].void_mask
+                vent_seeds = j_void & air_vent_reach
                 air_vent_reach = ndimage.binary_propagation(
-                    vent_seeds, structure=_CONN_2D_8, mask=layers[j_idx0].void_mask
+                    vent_seeds, structure=_CONN_2D_8, mask=j_void
                 )
-                trapped_mask = layers[j_idx0].void_mask & (~air_vent_reach)
+                trapped_mask = j_void & (~air_vent_reach)
                 trapped_px = int(np.count_nonzero(trapped_mask))
                 if trapped_px > 0:
                     if trapped_px > max(ghost_min_px, int(0.02 * void_counts[j_idx0])):
@@ -148,18 +152,21 @@ def compute_optimal_cure_schedule(
                         if int(t_sizes.max()) > ghost_min_px:
                             break
 
-                dark_core = (
-                    ndimage.binary_erosion(solid_above, structure=bleed_disk)
-                    if bleed_disk is not None
-                    else solid_above
-                )
-                cum_shadow_px += int(np.count_nonzero(layers[j_idx0].void_mask & dark_core))
+                if np.any(j_void & solid_above):
+                    dark_core = (
+                        ndimage.binary_erosion(solid_above, structure=bleed_disk)
+                        if bleed_disk is not None
+                        else solid_above
+                    )
+                    cum_shadow_px += int(np.count_nonzero(j_void & dark_core))
                 cum_void_px += void_counts[j_idx0]
 
             if dp_cost[p] == inf:
                 continue
 
-            if p < k - 1 and not _slab_3d_needle_accessible(layers, p, k - 1, ghost_min_px=ghost_min_px):
+            if p < k - 1 and not _slab_3d_needle_accessible(
+                layers, p, k - 1, ghost_min_px=ghost_min_px, top_2d_ok=top_2d_ok
+            ):
                 break
 
             shadow_ratio = cum_shadow_px / max(1, cum_void_px)

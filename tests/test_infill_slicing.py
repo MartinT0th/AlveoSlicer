@@ -10,6 +10,7 @@ import trimesh
 from alveoslicer import (
     CELL_PATTERNS,
     INFILL_ENGINES,
+    SLICING_GENERATORS,
     STANDARD_INFILL_PATTERNS,
     TOP_BOTTOM_FILL_PATTERNS,
     SlicerConfig,
@@ -21,6 +22,52 @@ from alveoslicer import (
     parse_gcode,
     slice_mesh,
 )
+
+
+def make_watertight_xz_prism(
+    x_edges: list[float],
+    z_edges: list[float],
+    filled_cells: set[tuple[int, int]],
+    y0: float = 105.0,
+    y1: float = 115.0,
+) -> trimesh.Trimesh:
+    """Build a watertight manifold extruded prism from an XZ grid without external triangulation."""
+    nx, nz = len(x_edges), len(z_edges)
+    verts = np.array(
+        [
+            [x_edges[ix], y0 if iy == 0 else y1, z_edges[iz]]
+            for ix in range(nx)
+            for iy in range(2)
+            for iz in range(nz)
+        ],
+        dtype=np.float64,
+    )
+
+    def _vid(ix: int, iy: int, iz: int) -> int:
+        return (ix * 2 + iy) * nz + iz
+
+    faces: list[tuple[int, int, int]] = []
+
+    def _quad(a: int, b: int, c: int, d: int, out_n: tuple[float, float, float]) -> None:
+        cross = np.cross(verts[b] - verts[a], verts[c] - verts[a])
+        if float(np.dot(cross, out_n)) >= 0.0:
+            faces.extend([(a, b, c), (a, c, d)])
+        else:
+            faces.extend([(a, c, b), (a, d, c)])
+
+    for ix, iz in sorted(filled_cells):
+        _quad(_vid(ix, 0, iz), _vid(ix + 1, 0, iz), _vid(ix + 1, 0, iz + 1), _vid(ix, 0, iz + 1), (0.0, -1.0, 0.0))
+        _quad(_vid(ix, 1, iz), _vid(ix + 1, 1, iz), _vid(ix + 1, 1, iz + 1), _vid(ix, 1, iz + 1), (0.0, 1.0, 0.0))
+        if (ix - 1, iz) not in filled_cells:
+            _quad(_vid(ix, 0, iz), _vid(ix, 1, iz), _vid(ix, 1, iz + 1), _vid(ix, 0, iz + 1), (-1.0, 0.0, 0.0))
+        if (ix + 1, iz) not in filled_cells:
+            _quad(_vid(ix + 1, 0, iz), _vid(ix + 1, 1, iz), _vid(ix + 1, 1, iz + 1), _vid(ix + 1, 0, iz + 1), (1.0, 0.0, 0.0))
+        if (ix, iz - 1) not in filled_cells:
+            _quad(_vid(ix, 0, iz), _vid(ix + 1, 0, iz), _vid(ix + 1, 1, iz), _vid(ix, 1, iz), (0.0, 0.0, -1.0))
+        if (ix, iz + 1) not in filled_cells:
+            _quad(_vid(ix, 0, iz + 1), _vid(ix + 1, 0, iz + 1), _vid(ix + 1, 1, iz + 1), _vid(ix, 1, iz + 1), (0.0, 0.0, 1.0))
+
+    return trimesh.Trimesh(vertices=verts, faces=np.asarray(faces, dtype=np.int64), process=True)
 
 
 def assert_prusaslicer_296_contract(case: unittest.TestCase, gcode_text: str) -> None:
@@ -285,6 +332,110 @@ class TestInfillAndSlicing(unittest.TestCase):
                 and (bmin[1] - 2.0 <= 0.5 * (c.a[1] + c.b[1]) <= bmax[1] + 2.0)
             ]
             self.assertGreater(len(body_caps), 3, f"Mixed body {b_idx} missing 3D wireframe")
+
+    def test_all_cellular_generators_and_overhang_repair(self) -> None:
+        """Verify all 4 slicing generators and guarantee zero unanchored internal mid-air cantilevers."""
+        import shapely
+        from alveoslicer.core.geometry import safe_buffer, safe_union
+
+        base_wall = create_test_curved_wall_mesh(SlicerConfig())
+        max_bridge = 12.0
+        for gen in SLICING_GENERATORS:
+            cfg = SlicerConfig()
+            cfg.fff.layer_height = 0.50
+            cfg.slice_raster_pitch_mm = 0.50
+            cfg.voxel_pitch_mm = 0.85
+            cfg.infill.infill_engine = "surface_normal_3d"
+            cfg.infill.slicing_generator = gen
+            cfg.infill.pattern = "hexagonal"
+            cfg.infill.target_cell_pitch = 9.0
+            cfg.infill.max_bridge_span = max_bridge
+
+            res = slice_mesh(base_wall, cfg)
+            self.assertGreaterEqual(len(res.layers), 6, f"Generator '{gen}' produced too few layers")
+            self.assertGreater(len(res.capsules), 10, f"Generator '{gen}' produced too few wireframe capsules")
+            total_infill = sum(len(ly.inside_perimeter_lines) for ly in res.layers)
+            self.assertGreater(total_infill, 5, f"Generator '{gen}' produced no internal formwork lines")
+
+            stepout = max(1.0, cfg.fff.line_width * 0.90)
+            for k in range(1, len(res.layers)):
+                prev = res.layers[k - 1]
+                cur = res.layers[k]
+                if not cur.inside_perimeter_lines or prev.outer_geom is None or prev.outer_geom.is_empty:
+                    continue
+                anchors = [prev.outer_geom]
+                if prev.cell_wall_geom is not None and not prev.cell_wall_geom.is_empty:
+                    anchors.append(safe_buffer(prev.cell_wall_geom, stepout, join_style=2))
+                anchor_zone = safe_union(anchors)
+                shapely.prepare(anchor_zone)
+                for seg in cur.inside_perimeter_lines:
+                    if len(seg) < 2:
+                        continue
+                    ls = shapely.LineString(seg[:, :2])
+                    p0_ok = shapely.contains_xy(anchor_zone, float(seg[0, 0]), float(seg[0, 1]))
+                    p1_ok = shapely.contains_xy(anchor_zone, float(seg[-1, 0]), float(seg[-1, 1]))
+                    if not (p0_ok and p1_ok and ls.length <= max_bridge + 0.5):
+                        uncovered = ls.difference(anchor_zone)
+                        self.assertLessEqual(
+                            uncovered.length,
+                            max_bridge + 0.5,
+                            f"{gen} layer {k}: unanchored internal cantilever len={uncovered.length:.2f}",
+                        )
+
+    def test_prusaslicer_supports_raft_bottom_gap_bridges_and_organic_lean(self) -> None:
+        """Verify raft layers, bottom Z gap + interfaces, bridge skipping, and organic tree lean."""
+        arch = make_watertight_xz_prism(
+            x_edges=[96.0, 102.0, 108.0, 114.0, 126.0],
+            z_edges=[0.0, 5.0, 8.0],
+            filled_cells={(0, 0), (2, 0), (0, 1), (1, 1), (2, 1), (3, 1)},
+        )
+
+        cfg = SlicerConfig()
+        cfg.printer.printer_capability = "fff_only"
+        cfg.infill.infill_engine = "standard"
+        cfg.infill.standard_fill_pattern = "grid"
+        cfg.infill.fill_density_pct = 15.0
+        cfg.fff.layer_height = 0.50
+        cfg.fff.first_layer_height = 0.50
+        cfg.fff.support_enable = True
+        cfg.fff.support_style = "organic"
+        cfg.fff.support_overhang_angle_deg = 45.0
+        cfg.fff.support_raft_layers = 2
+        cfg.fff.support_bottom_z_distance_mm = 0.50
+        cfg.fff.support_bottom_interface_layers = 1
+        cfg.fff.support_interface_layers = 2
+        cfg.fff.support_dont_support_bridges = True
+        cfg.fff.support_branch_diameter_mm = 2.0
+        cfg.fff.support_branch_angle_deg = 40.0
+
+        res_nobridge = slice_mesh(arch, cfg)
+        self.assertGreaterEqual(len(res_nobridge.layers), 18)
+        self.assertTrue(res_nobridge.layers[0].outer_geom is None or res_nobridge.layers[0].outer_geom.is_empty)
+        self.assertTrue(res_nobridge.layers[1].outer_geom is None or res_nobridge.layers[1].outer_geom.is_empty)
+        self.assertGreater(len(res_nobridge.layers[0].ext_support_lines), 0)
+        self.assertGreater(len(res_nobridge.layers[1].ext_support_interface_lines), 0)
+        self.assertTrue(res_nobridge.layers[2].outer_geom is not None and not res_nobridge.layers[2].outer_geom.is_empty)
+        self.assertGreater(res_nobridge.layers[2].z, res_nobridge.layers[1].z + cfg.fff.layer_height * 0.5)
+        self.assertIn(";TYPE:Support material interface", res_nobridge.gcode_text)
+        self.assertIn(";TYPE:Support material", res_nobridge.gcode_text)
+        assert_prusaslicer_296_contract(self, res_nobridge.gcode_text)
+
+        sup_count_no_bridge = sum(
+            len(ly.ext_support_lines) + len(ly.ext_support_interface_lines)
+            for ly in res_nobridge.layers[2:]
+        )
+
+        cfg.fff.support_dont_support_bridges = False
+        res_with_bridge = slice_mesh(arch, cfg)
+        sup_count_with_bridge = sum(
+            len(ly.ext_support_lines) + len(ly.ext_support_interface_lines)
+            for ly in res_with_bridge.layers[2:]
+        )
+        self.assertGreater(
+            sup_count_with_bridge,
+            sup_count_no_bridge,
+            "Disabling dont_support_bridges should emit additional support columns under the bridge span",
+        )
 
 
 if __name__ == "__main__":

@@ -16,13 +16,19 @@ class ConsoleGCodeView(QWidget):
         self._preview_line_limit = preview_line_limit
 
         vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(10, 6, 10, 10)
+        vbox.setSpacing(6)
 
-        vbox.addWidget(QLabel("Slicer Pipeline Log:"))
+        lbl_log = QLabel("Slicer Pipeline Log")
+        lbl_log.setObjectName("sectionTitle")
+        vbox.addWidget(lbl_log)
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         vbox.addWidget(self.txt_log, stretch=1)
 
-        vbox.addWidget(QLabel(f"G-Code Preview (first {preview_line_limit} lines):"))
+        lbl_gc = QLabel(f"G-Code Preview (first {preview_line_limit} lines)")
+        lbl_gc.setObjectName("sectionTitle")
+        vbox.addWidget(lbl_gc)
         self.txt_gcode = QPlainTextEdit()
         self.txt_gcode.setReadOnly(True)
         vbox.addWidget(self.txt_gcode, stretch=1)
@@ -37,5 +43,5 @@ class ConsoleGCodeView(QWidget):
 
     def set_gcode_preview(self, gcode_text: str) -> None:
         """Display the first ``preview_line_limit`` lines of ``gcode_text``."""
-        preview = "\n".join(gcode_text.splitlines()[: self._preview_line_limit])
-        self.txt_gcode.setPlainText(preview)
+        lines = gcode_text.split("\n", self._preview_line_limit)[: self._preview_line_limit]
+        self.txt_gcode.setPlainText("\n".join(line.rstrip("\r") for line in lines))

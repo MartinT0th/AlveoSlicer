@@ -173,20 +173,33 @@ class AlveoViewport3D(QOpenGLWidget):
         self._gizmo_lit_cpu, self._gizmo_lines_cpu = z9(), z6()
         self._cut_plane_lit_cpu, self._cut_plane_lines_cpu = z9(), z6()
         self._brush_reticle_cpu = z6()
-        self._all_beads_cpu = np.zeros((0, 48, 9), dtype=np.float32)
-        self._all_caps_cpu = np.zeros((0, 24, 9), dtype=np.float32)
-        self._all_caps_seg_idx = np.zeros((0,), dtype=np.int32)
-        self._resin_cycles: List[Tuple[int, List[Tuple[int, np.ndarray]]]] = []
-        self._active_beads_cpu, self._active_resin_cpu = z9(), z9()
-        self._active_travels_cpu, self._active_dosing_cpu, self._nozzle_cpu = z6(), z6(), z9()
+        # Static preview GPU datasets (uploaded ONCE in set_gcode_preview; never copied on scrub)
+        self._bead_type_cpu: Dict[int, np.ndarray] = {}
+        self._bead_type_layers: Dict[int, np.ndarray] = {}
+        self._bead_type_moves: Dict[int, np.ndarray] = {}
+        self._cap_type_cpu: Dict[int, np.ndarray] = {}
+        self._cap_type_layers: Dict[int, np.ndarray] = {}
+        self._cap_type_moves: Dict[int, np.ndarray] = {}
+        self._resin_all_cpu = z9()
+        self._resin_cycle_ranges: List[Tuple[int, List[Tuple[int, int, int]]]] = []
+        self._travels_all_cpu = z6()
+        # Lightweight per-scrub draw ranges (O(log N) searchsorted; zero GPU re-upload)
+        self._active_bead_ranges: Dict[int, Tuple[int, int]] = {}
+        self._active_cap_ranges: Dict[int, Tuple[int, int]] = {}
+        self._active_resin_ranges: List[Tuple[int, int]] = []
+        self._active_travel_range: Tuple[int, int] = (0, 0)
+        self._active_dosing_cpu, self._nozzle_cpu = z6(), z9()
 
         # VBO dirty flags & GL handles
         self._gl_ready = False
         self._dirty_bed = self._dirty_mesh = self._dirty_wipe = self._dirty_place = True
-        self._dirty_wire = self._dirty_gizmo = self._dirty_cut = self._dirty_brush = self._dirty_preview = True
+        self._dirty_wire = self._dirty_gizmo = self._dirty_cut = self._dirty_brush = True
+        self._dirty_preview_static = self._dirty_preview_dynamic = True
         self._gl: Optional[QOpenGLFunctions] = None
         self._lit_prog: Optional[QOpenGLShaderProgram] = None
         self._line_prog: Optional[QOpenGLShaderProgram] = None
+        self._lit_locs: Tuple[int, int, int, int, int, int] = (-1, -1, -1, -1, -1, -1)
+        self._line_locs: Tuple[int, int, int, int] = (-1, -1, -1, -1)
         self._vbos: Dict[str, Tuple[QOpenGLBuffer, int]] = {}
 
         self._rebuild_bed_geometry()
@@ -201,9 +214,15 @@ class AlveoViewport3D(QOpenGLWidget):
         return float(self._last_eye[2]) < 0.0
 
     def set_theme_mode(self, mode: str) -> None:
-        """Apply Dark/Light theme colors to the viewport background and build plate."""
+        """Apply Dark/Light theme colors to the viewport background, build plate, and active meshes."""
         self._palette = get_palette(mode)
         self._rebuild_bed_geometry()
+        if self._instances_by_id:
+            self.set_scene_instances(
+                list(self._instances_by_id.values()),
+                self._selected_id,
+                capsules=getattr(self, "_last_capsules", None),
+            )
         self.update()
 
     def set_mode(self, mode: str) -> None:
@@ -412,7 +431,7 @@ class AlveoViewport3D(QOpenGLWidget):
             if mesh is None or len(mesh.faces) == 0:
                 continue
             is_sel = inst.instance_id == selected_id
-            col = (0.95, 0.77, 0.13) if is_sel else (0.64, 0.56, 0.28)
+            col = self._palette.gl_model_selected if is_sel else self._palette.gl_model_default
             paint = inst.paint_support if (inst.paint_support is not None and len(inst.paint_support) == len(mesh.faces)) else None
             chunks.append(mesh_to_lit_buffer(mesh, col, paint_support=paint))
 
@@ -429,7 +448,7 @@ class AlveoViewport3D(QOpenGLWidget):
                 pad = 1.2
                 x0, y0, z0 = float(bmin[0] - pad), float(bmin[1] - pad), max(0.06, float(bmin[2]))
                 x1, y1, z1 = float(bmax[0] + pad), float(bmax[1] + pad), float(bmax[2] + pad)
-                yc, tick = (0.98, 0.82, 0.14), min(6.0, 0.22 * (z1 - z0))
+                yc, tick = self._palette.gl_accent, min(6.0, 0.22 * (z1 - z0))
                 segs = [
                     ((x0, y0, 0.08), (x1, y0, 0.08)), ((x1, y0, 0.08), (x1, y1, 0.08)),
                     ((x1, y1, 0.08), (x0, y1, 0.08)), ((x0, y1, 0.08), (x0, y0, 0.08)),
@@ -457,7 +476,7 @@ class AlveoViewport3D(QOpenGLWidget):
         self._instances_by_id, self._selected_id, self._pick_instances = {}, None, []
         self._selection_box_cpu = np.zeros((0, 6), dtype=np.float32)
         self._mesh_cpu = (
-            mesh_to_lit_buffer(mesh, (0.93, 0.76, 0.14))
+            mesh_to_lit_buffer(mesh, self._palette.gl_model_selected)
             if (mesh is not None and len(mesh.faces) > 0)
             else np.zeros((0, 9), dtype=np.float32)
         )
@@ -467,6 +486,7 @@ class AlveoViewport3D(QOpenGLWidget):
 
     def set_wireframe(self, capsules: Optional[List[Capsule]]) -> None:
         """Upload subsampled 3D cellular lattice struts for translucent editor overlay."""
+        self._last_capsules = capsules
         if not capsules:
             self._wireframe_cpu = np.zeros((0, 6), dtype=np.float32)
         else:
@@ -475,7 +495,7 @@ class AlveoViewport3D(QOpenGLWidget):
             for idx, cap in enumerate(sub):
                 pts[2 * idx, 0:3] = cap.a
                 pts[2 * idx + 1, 0:3] = cap.b
-            pts[:, 3:6] = np.array([0.05, 0.82, 0.95], dtype=np.float32)
+            pts[:, 3:6] = np.array(self._palette.gl_uv, dtype=np.float32)
             self._wireframe_cpu = pts
         self._dirty_wire = True
         self.update()
@@ -483,20 +503,76 @@ class AlveoViewport3D(QOpenGLWidget):
     def set_gcode_preview(
         self, data: Optional[GCodePreviewData], slice_result: Optional[SliceResult] = None
     ) -> None:
-        """Compile rounded filament beads and per-cure-cycle Filled Resin meshes for previewing."""
+        """Compile static per-feature rounded filament VBOs and Filled Resin slabs once per slice."""
         self.preview_data = data
+        self._bead_type_cpu = {}
+        self._bead_type_layers = {}
+        self._bead_type_moves = {}
+        self._cap_type_cpu = {}
+        self._cap_type_layers = {}
+        self._cap_type_moves = {}
+        self._resin_all_cpu = np.zeros((0, 9), dtype=np.float32)
+        self._resin_cycle_ranges = []
+        self._travels_all_cpu = np.zeros((0, 6), dtype=np.float32)
+
         if data is None or data.num_layers == 0:
-            self._all_beads_cpu = np.zeros((0, 48, 9), dtype=np.float32)
-            self._all_caps_cpu = np.zeros((0, 24, 9), dtype=np.float32)
-            self._all_caps_seg_idx = np.zeros((0,), dtype=np.int32)
-            self._resin_cycles = []
+            self._dirty_preview_static = True
             self._rebuild_preview_slice()
             return
 
-        self._all_beads_cpu, self._all_caps_cpu, self._all_caps_seg_idx = build_extrusion_beads(
+        beads, caps, caps_seg_idx = build_extrusion_beads(
             data.ext_p0, data.ext_p1, data.ext_width, data.ext_height, data.ext_type, layers=data.ext_layer
         )
-        self._resin_cycles = build_filled_resin_cycles(slice_result)
+        n_types = len(FEATURE_TYPES)
+        ext_type = np.clip(data.ext_type, 0, n_types - 1)
+        cap_type = ext_type[caps_seg_idx] if len(caps_seg_idx) > 0 else np.zeros((0,), dtype=np.int32)
+        cap_layers = data.ext_layer[caps_seg_idx] if len(caps_seg_idx) > 0 else np.zeros((0,), dtype=np.int32)
+        cap_moves = data.ext_move_idx[caps_seg_idx] if len(caps_seg_idx) > 0 else np.zeros((0,), dtype=np.int32)
+
+        # Partition static geometry per feature type preserving monotonic (layer, move_idx) order
+        for tid in range(n_types):
+            idx = np.flatnonzero(ext_type == tid)
+            if len(idx) > 0:
+                self._bead_type_cpu[tid] = np.ascontiguousarray(beads[idx].reshape(-1, 9), dtype=np.float32)
+                self._bead_type_layers[tid] = data.ext_layer[idx]
+                self._bead_type_moves[tid] = data.ext_move_idx[idx]
+            if len(caps_seg_idx) > 0:
+                c_idx = np.flatnonzero(cap_type == tid)
+                if len(c_idx) > 0:
+                    # Ensure monotonic (layer, move_idx) ordering across start/end caps
+                    order = np.lexsort((cap_moves[c_idx], cap_layers[c_idx]))
+                    c_ord = c_idx[order]
+                    self._cap_type_cpu[tid] = np.ascontiguousarray(caps[c_ord].reshape(-1, 9), dtype=np.float32)
+                    self._cap_type_layers[tid] = cap_layers[c_ord]
+                    self._cap_type_moves[tid] = cap_moves[c_ord]
+
+        # Pack all filled-resin cycle slabs into one static VBO with per-layer vertex spans
+        resin_cycles = build_filled_resin_cycles(slice_result)
+        if resin_cycles:
+            resin_chunks: List[np.ndarray] = []
+            offset = 0
+            for cyc_end, layer_meshes in resin_cycles:
+                spans: List[Tuple[int, int, int]] = []
+                for l_idx, verts in layer_meshes:
+                    cnt = len(verts)
+                    if cnt > 0:
+                        resin_chunks.append(verts)
+                        spans.append((l_idx, offset, cnt))
+                        offset += cnt
+                if spans:
+                    self._resin_cycle_ranges.append((cyc_end, spans))
+            if resin_chunks:
+                self._resin_all_cpu = np.ascontiguousarray(np.vstack(resin_chunks), dtype=np.float32)
+
+        # Pack all travel segments once in monotonic (layer, move_idx) order
+        if len(data.trv_p0) > 0:
+            tbuf = np.empty((len(data.trv_p0) * 2, 6), dtype=np.float32)
+            tbuf[0::2, 0:3] = data.trv_p0
+            tbuf[1::2, 0:3] = data.trv_p1
+            tbuf[:, 3:6] = np.array(TRAVEL_COLOR, dtype=np.float32)
+            self._travels_all_cpu = tbuf
+
+        self._dirty_preview_static = True
         self.layer_min = 1
         self.layer_max = data.num_layers
         self.top_move_limit = data.layer_move_counts[-1] if data.layer_move_counts else 10**9
@@ -637,81 +713,104 @@ class AlveoViewport3D(QOpenGLWidget):
         )
         self._dirty_bed = True
 
+    @property
+    def _active_resin_cpu(self) -> np.ndarray:
+        """Return active Filled Resin vertices on demand (tests/inspection); rendering uses static GPU VBO ranges."""
+        if not self._active_resin_ranges or len(self._resin_all_cpu) == 0:
+            return np.zeros((0, 9), dtype=np.float32)
+        if len(self._active_resin_ranges) == 1:
+            s, c = self._active_resin_ranges[0]
+            return self._resin_all_cpu[s : s + c]
+        return np.vstack([self._resin_all_cpu[s : s + c] for s, c in self._active_resin_ranges])
+
+    @staticmethod
+    def _range_for_layer_move(
+        layers_arr: np.ndarray,
+        moves_arr: np.ndarray,
+        layer_min: int,
+        layer_max: int,
+        top_move_limit: int,
+    ) -> Tuple[int, int]:
+        """O(log N) half-open slice ``(start, count)`` for monotonic ``(layer, move_idx)`` arrays."""
+        s = int(np.searchsorted(layers_arr, layer_min, side="left"))
+        e_lo = int(np.searchsorted(layers_arr, layer_max, side="left"))
+        e_hi = int(np.searchsorted(layers_arr, layer_max, side="right"))
+        if e_lo < e_hi:
+            e = e_lo + int(np.searchsorted(moves_arr[e_lo:e_hi], top_move_limit, side="right"))
+        else:
+            e = e_hi
+        return (s, e - s) if e > s else (0, 0)
+
     def _rebuild_preview_slice(self) -> None:
-        """Filter precomputed beads, post-dosing Filled Resin cycles, travels, and dosing pins for the current slider state."""
+        """Update O(log N) GPU draw ranges for the current layer/move/feature filters without re-uploading VBOs."""
         data = self.preview_data
-        if data is None or len(self._all_beads_cpu) == 0:
-            self._active_beads_cpu = self._active_resin_cpu = self._nozzle_cpu = np.zeros((0, 9), dtype=np.float32)
-            self._active_travels_cpu = self._active_dosing_cpu = np.zeros((0, 6), dtype=np.float32)
-            self._dirty_preview = True
+        self._active_bead_ranges = {}
+        self._active_cap_ranges = {}
+        self._active_resin_ranges = []
+        self._active_travel_range = (0, 0)
+
+        if data is None or not self._bead_type_layers:
+            self._nozzle_cpu = np.zeros((0, 9), dtype=np.float32)
+            self._active_dosing_cpu = np.zeros((0, 6), dtype=np.float32)
+            self._dirty_preview_dynamic = True
             self.update()
             return
 
-        in_range = (data.ext_layer >= self.layer_min) & (data.ext_layer <= self.layer_max)
-        within_top = (data.ext_layer < self.layer_max) | (data.ext_move_idx <= self.top_move_limit)
-        type_allowed = np.array([self.visible_types.get(i, True) for i in range(len(FEATURE_TYPES))], dtype=bool)
-        mask = in_range & within_top & type_allowed[np.clip(data.ext_type, 0, len(type_allowed) - 1)]
-
-        if np.any(mask):
-            bead_verts = self._all_beads_cpu[mask].reshape(-1, 9)
-            if len(self._all_caps_seg_idx) > 0:
-                cap_mask = mask[self._all_caps_seg_idx]
-                self._active_beads_cpu = (
-                    np.vstack([bead_verts, self._all_caps_cpu[cap_mask].reshape(-1, 9)])
-                    if np.any(cap_mask) else bead_verts
-                )
-            else:
-                self._active_beads_cpu = bead_verts
-        else:
-            self._active_beads_cpu = np.zeros((0, 9), dtype=np.float32)
+        lmin, lmax, mlim = self.layer_min, self.layer_max, self.top_move_limit
+        for tid, l_arr in self._bead_type_layers.items():
+            if not self.visible_types.get(tid, True):
+                continue
+            s, cnt = self._range_for_layer_move(l_arr, self._bead_type_moves[tid], lmin, lmax, mlim)
+            if cnt > 0:
+                self._active_bead_ranges[tid] = (s * 48, cnt * 48)
+            c_arr = self._cap_type_layers.get(tid)
+            if c_arr is not None:
+                cs, ccnt = self._range_for_layer_move(c_arr, self._cap_type_moves[tid], lmin, lmax, mlim)
+                if ccnt > 0:
+                    self._active_cap_ranges[tid] = (cs * 24, ccnt * 24)
 
         # Filled resin appears strictly AFTER its cure cycle has been dosed
         resin_id = FEATURE_TYPE_TO_ID.get("Filled resin", -1)
-        if resin_id >= 0 and self.visible_types.get(resin_id, True) and self._resin_cycles:
-            resin_chunks: List[np.ndarray] = []
-            for cyc_end, layer_meshes in self._resin_cycles:
-                if self.layer_max < cyc_end:
+        if resin_id >= 0 and self.visible_types.get(resin_id, True) and self._resin_cycle_ranges:
+            merged: List[Tuple[int, int]] = []
+            for cyc_end, spans in self._resin_cycle_ranges:
+                if lmax < cyc_end:
                     continue
-                if self.layer_max == cyc_end and data.layer_move_counts:
+                if lmax == cyc_end and data.layer_move_counts:
                     idx0 = max(0, min(len(data.layer_move_counts) - 1, cyc_end - 1))
-                    if self.top_move_limit < data.layer_move_counts[idx0]:
+                    if mlim < data.layer_move_counts[idx0]:
                         continue
-                for l_idx, verts in layer_meshes:
-                    if self.layer_min <= l_idx <= self.layer_max:
-                        resin_chunks.append(verts)
-            self._active_resin_cpu = np.vstack(resin_chunks) if resin_chunks else np.zeros((0, 9), dtype=np.float32)
-        else:
-            self._active_resin_cpu = np.zeros((0, 9), dtype=np.float32)
+                for l_idx, start_v, cnt_v in spans:
+                    if lmin <= l_idx <= lmax:
+                        if merged and merged[-1][0] + merged[-1][1] == start_v:
+                            merged[-1] = (merged[-1][0], merged[-1][1] + cnt_v)
+                        else:
+                            merged.append((start_v, cnt_v))
+            self._active_resin_ranges = merged
 
-        top_idxs = np.flatnonzero((data.ext_layer == self.layer_max) & (data.ext_move_idx <= self.top_move_limit))
-        self._nozzle_cpu = (
-            build_nozzle_cone(*map(float, data.ext_p1[top_idxs[-1]]))
-            if len(top_idxs) > 0 else np.zeros((0, 9), dtype=np.float32)
-        )
-
-        if self.show_travels and len(data.trv_p0) > 0:
-            tm = (
-                (data.trv_layer >= self.layer_min) & (data.trv_layer <= self.layer_max)
-                & ((data.trv_layer < self.layer_max) | (data.trv_move_idx <= self.top_move_limit))
-            )
-            if np.any(tm):
-                p0, p1 = data.trv_p0[tm], data.trv_p1[tm]
-                buf = np.empty((len(p0) * 2, 6), dtype=np.float32)
-                buf[0::2, 0:3], buf[1::2, 0:3] = p0, p1
-                buf[:, 3:6] = np.array(TRAVEL_COLOR, dtype=np.float32)
-                self._active_travels_cpu = buf
+        # Locate active nozzle endpoint in O(log N) via searchsorted
+        e_lo = int(np.searchsorted(data.ext_layer, lmax, side="left"))
+        e_hi = int(np.searchsorted(data.ext_layer, lmax, side="right"))
+        if e_lo < e_hi:
+            top_pos = e_lo + int(np.searchsorted(data.ext_move_idx[e_lo:e_hi], mlim, side="right")) - 1
+            if top_pos >= e_lo:
+                self._nozzle_cpu = build_nozzle_cone(*map(float, data.ext_p1[top_pos]))
             else:
-                self._active_travels_cpu = np.zeros((0, 6), dtype=np.float32)
+                self._nozzle_cpu = np.zeros((0, 9), dtype=np.float32)
         else:
-            self._active_travels_cpu = np.zeros((0, 6), dtype=np.float32)
+            self._nozzle_cpu = np.zeros((0, 9), dtype=np.float32)
+
+        if self.show_travels and len(data.trv_layer) > 0:
+            ts, tcnt = self._range_for_layer_move(data.trv_layer, data.trv_move_idx, lmin, lmax, mlim)
+            self._active_travel_range = (ts * 2, tcnt * 2)
 
         if self.show_dosing and data.dosing_markers:
             d_lines: List[List[float]] = []
             prev_by_layer: Dict[int, Tuple[float, float, float]] = {}
             for m in data.dosing_markers:
-                if not (self.layer_min <= m.layer_idx <= self.layer_max):
+                if not (lmin <= m.layer_idx <= lmax):
                     continue
-                is_top = m.layer_idx == self.layer_max
+                is_top = m.layer_idx == lmax
                 col = DOSING_COLOR if is_top else (0.0, 0.55, 0.72)
                 pin_h, r = (4.2, 1.0) if is_top else (1.8, 0.55)
                 d_lines.extend([
@@ -727,7 +826,7 @@ class AlveoViewport3D(QOpenGLWidget):
         else:
             self._active_dosing_cpu = np.zeros((0, 6), dtype=np.float32)
 
-        self._dirty_preview = True
+        self._dirty_preview_dynamic = True
         self.update()
 
     # ------------------------------------------------------------------
@@ -743,15 +842,30 @@ class AlveoViewport3D(QOpenGLWidget):
         self._lit_prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, LIT_VERT_SRC)
         self._lit_prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, LIT_FRAG_SRC)
         self._lit_prog.link()
+        self._lit_locs = (
+            self._lit_prog.uniformLocation("u_mvp"),
+            self._lit_prog.uniformLocation("u_alpha_v"),
+            self._lit_prog.uniformLocation("u_view_dir"),
+            self._lit_prog.attributeLocation("a_pos"),
+            self._lit_prog.attributeLocation("a_norm"),
+            self._lit_prog.attributeLocation("a_color"),
+        )
 
         self._line_prog = QOpenGLShaderProgram(self)
         self._line_prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, LINE_VERT_SRC)
         self._line_prog.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, LINE_FRAG_SRC)
         self._line_prog.link()
+        self._line_locs = (
+            self._line_prog.uniformLocation("u_mvp"),
+            self._line_prog.uniformLocation("u_alpha_v"),
+            self._line_prog.attributeLocation("a_pos"),
+            self._line_prog.attributeLocation("a_color"),
+        )
 
         self._gl_ready = True
         self._dirty_bed = self._dirty_mesh = self._dirty_wipe = self._dirty_place = True
-        self._dirty_wire = self._dirty_gizmo = self._dirty_cut = self._dirty_brush = self._dirty_preview = True
+        self._dirty_wire = self._dirty_gizmo = self._dirty_cut = self._dirty_brush = True
+        self._dirty_preview_static = self._dirty_preview_dynamic = True
 
     def _upload_vbo(self, key: str, arr: np.ndarray) -> None:
         """Allocate or update GPU vertex buffer ``key`` from numpy array ``arr``."""
@@ -764,7 +878,7 @@ class AlveoViewport3D(QOpenGLWidget):
         if count > 0:
             vbo.bind()
             raw = np.ascontiguousarray(arr, dtype=np.float32)
-            vbo.allocate(raw.tobytes(), raw.nbytes)
+            vbo.allocate(raw.data, raw.nbytes)
             vbo.release()
         self._vbos[key] = (vbo, count)
 
@@ -779,13 +893,22 @@ class AlveoViewport3D(QOpenGLWidget):
             ("_dirty_gizmo", [("gizmo_lit", self._gizmo_lit_cpu), ("gizmo_lines", self._gizmo_lines_cpu)]),
             ("_dirty_cut", [("cut_lit", self._cut_plane_lit_cpu), ("cut_lines", self._cut_plane_lines_cpu)]),
             ("_dirty_brush", [("brush_reticle", self._brush_reticle_cpu)]),
-            ("_dirty_preview", [("beads", self._active_beads_cpu), ("resin", self._active_resin_cpu), ("travels", self._active_travels_cpu), ("dosing", self._active_dosing_cpu), ("nozzle", self._nozzle_cpu)]),
+            ("_dirty_preview_dynamic", [("dosing", self._active_dosing_cpu), ("nozzle", self._nozzle_cpu)]),
         ]
         for flag, items in groups:
             if getattr(self, flag):
                 for key, arr in items:
                     self._upload_vbo(key, arr)
                 setattr(self, flag, False)
+
+        if self._dirty_preview_static:
+            empty9 = np.zeros((0, 9), dtype=np.float32)
+            for tid in range(len(FEATURE_TYPES)):
+                self._upload_vbo(f"beads_t{tid}", self._bead_type_cpu.get(tid, empty9))
+                self._upload_vbo(f"caps_t{tid}", self._cap_type_cpu.get(tid, empty9))
+            self._upload_vbo("resin_all", self._resin_all_cpu)
+            self._upload_vbo("travels_all", self._travels_all_cpu)
+            self._dirty_preview_static = False
 
     def _compute_mvp_and_eye(self) -> Tuple[QMatrix4x4, QVector3D]:
         """Compute perspective-view matrix and camera view direction."""
@@ -811,49 +934,109 @@ class AlveoViewport3D(QOpenGLWidget):
         m.translate(float(ox), float(oy), 0.0)
         return m
 
-    def _draw_lit(self, key: str, mvp: QMatrix4x4, view_dir: QVector3D, alpha: float = 1.0) -> None:
-        """Render a shaded triangle VBO with two-light CAD hemisphere lighting."""
+    def _draw_lit(
+        self,
+        key: str,
+        mvp: QMatrix4x4,
+        view_dir: QVector3D,
+        alpha: float = 1.0,
+        first: int = 0,
+        count_override: Optional[int] = None,
+    ) -> None:
+        """Render a shaded triangle VBO (or sub-range) with two-light CAD hemisphere lighting."""
         if key not in self._vbos or self._lit_prog is None or self._gl is None:
             return
         vbo, count = self._vbos[key]
-        if count <= 0:
+        draw_count = count if count_override is None else min(count_override, max(0, count - first))
+        if draw_count <= 0:
             return
+        u_mvp, u_alpha, u_view, lp, ln, lc = self._lit_locs
         prog = self._lit_prog
         prog.bind()
-        prog.setUniformValue(prog.uniformLocation("u_mvp"), mvp)
-        prog.setUniformValue(prog.uniformLocation("u_alpha_v"), QVector2D(float(alpha), 0.0))
-        prog.setUniformValue(prog.uniformLocation("u_view_dir"), view_dir)
+        prog.setUniformValue(u_mvp, mvp)
+        prog.setUniformValue(u_alpha, QVector2D(float(alpha), 0.0))
+        prog.setUniformValue(u_view, view_dir)
         vbo.bind()
-        lp, ln, lc = prog.attributeLocation("a_pos"), prog.attributeLocation("a_norm"), prog.attributeLocation("a_color")
-        for loc, off in ((lp, 0), (ln, 12), (lc, 24)):
-            prog.enableAttributeArray(loc)
-            prog.setAttributeBuffer(loc, GL_FLOAT, off, 3, 36)
-        self._gl.glDrawArrays(GL_TRIANGLES, 0, count)
-        for loc in (lp, ln, lc):
-            prog.disableAttributeArray(loc)
+        prog.enableAttributeArray(lp)
+        prog.setAttributeBuffer(lp, GL_FLOAT, 0, 3, 36)
+        prog.enableAttributeArray(ln)
+        prog.setAttributeBuffer(ln, GL_FLOAT, 12, 3, 36)
+        prog.enableAttributeArray(lc)
+        prog.setAttributeBuffer(lc, GL_FLOAT, 24, 3, 36)
+        self._gl.glDrawArrays(GL_TRIANGLES, first, draw_count)
+        prog.disableAttributeArray(lp)
+        prog.disableAttributeArray(ln)
+        prog.disableAttributeArray(lc)
         vbo.release()
         prog.release()
 
-    def _draw_lines(self, key: str, mvp: QMatrix4x4, alpha: float = 1.0, width: float = 1.2) -> None:
-        """Render an unlit colored line-segment VBO."""
+    def _draw_lit_ranges(
+        self,
+        key: str,
+        ranges: List[Tuple[int, int]],
+        mvp: QMatrix4x4,
+        view_dir: QVector3D,
+        alpha: float = 1.0,
+    ) -> None:
+        """Render multiple contiguous sub-ranges of one static shaded VBO with a single bind."""
+        if not ranges or key not in self._vbos or self._lit_prog is None or self._gl is None:
+            return
+        vbo, total = self._vbos[key]
+        if total <= 0:
+            return
+        u_mvp, u_alpha, u_view, lp, ln, lc = self._lit_locs
+        prog = self._lit_prog
+        prog.bind()
+        prog.setUniformValue(u_mvp, mvp)
+        prog.setUniformValue(u_alpha, QVector2D(float(alpha), 0.0))
+        prog.setUniformValue(u_view, view_dir)
+        vbo.bind()
+        prog.enableAttributeArray(lp)
+        prog.setAttributeBuffer(lp, GL_FLOAT, 0, 3, 36)
+        prog.enableAttributeArray(ln)
+        prog.setAttributeBuffer(ln, GL_FLOAT, 12, 3, 36)
+        prog.enableAttributeArray(lc)
+        prog.setAttributeBuffer(lc, GL_FLOAT, 24, 3, 36)
+        gl_draw = self._gl.glDrawArrays
+        for first, cnt in ranges:
+            if cnt > 0 and first < total:
+                gl_draw(GL_TRIANGLES, first, min(cnt, total - first))
+        prog.disableAttributeArray(lp)
+        prog.disableAttributeArray(ln)
+        prog.disableAttributeArray(lc)
+        vbo.release()
+        prog.release()
+
+    def _draw_lines(
+        self,
+        key: str,
+        mvp: QMatrix4x4,
+        alpha: float = 1.0,
+        width: float = 1.2,
+        first: int = 0,
+        count_override: Optional[int] = None,
+    ) -> None:
+        """Render an unlit colored line-segment VBO (or sub-range)."""
         if key not in self._vbos or self._line_prog is None or self._gl is None:
             return
         vbo, count = self._vbos[key]
-        if count <= 0:
+        draw_count = count if count_override is None else min(count_override, max(0, count - first))
+        if draw_count <= 0:
             return
+        u_mvp, u_alpha, lp, lc = self._line_locs
         prog = self._line_prog
         prog.bind()
-        prog.setUniformValue(prog.uniformLocation("u_mvp"), mvp)
-        prog.setUniformValue(prog.uniformLocation("u_alpha_v"), QVector2D(float(alpha), 0.0))
+        prog.setUniformValue(u_mvp, mvp)
+        prog.setUniformValue(u_alpha, QVector2D(float(alpha), 0.0))
         vbo.bind()
-        lp, lc = prog.attributeLocation("a_pos"), prog.attributeLocation("a_color")
-        for loc, off in ((lp, 0), (lc, 12)):
-            prog.enableAttributeArray(loc)
-            prog.setAttributeBuffer(loc, GL_FLOAT, off, 3, 24)
+        prog.enableAttributeArray(lp)
+        prog.setAttributeBuffer(lp, GL_FLOAT, 0, 3, 24)
+        prog.enableAttributeArray(lc)
+        prog.setAttributeBuffer(lc, GL_FLOAT, 12, 3, 24)
         self._gl.glLineWidth(width)
-        self._gl.glDrawArrays(GL_LINES, 0, count)
-        for loc in (lp, lc):
-            prog.disableAttributeArray(loc)
+        self._gl.glDrawArrays(GL_LINES, first, draw_count)
+        prog.disableAttributeArray(lp)
+        prog.disableAttributeArray(lc)
         vbo.release()
         prog.release()
 
@@ -934,14 +1117,24 @@ class AlveoViewport3D(QOpenGLWidget):
                 self._draw_lines("brush_reticle", mvp_active, alpha=0.98, width=2.0)
                 gl.glEnable(GL_DEPTH_TEST)
         else:
-            self._draw_lit("beads", mvp_active, view_dir, alpha=1.0)
-            if self._active_resin_cpu.shape[0] > 0:
+            for tid, (first, cnt) in self._active_bead_ranges.items():
+                self._draw_lit(f"beads_t{tid}", mvp_active, view_dir, alpha=1.0, first=first, count_override=cnt)
+            for tid, (first, cnt) in self._active_cap_ranges.items():
+                self._draw_lit(f"caps_t{tid}", mvp_active, view_dir, alpha=1.0, first=first, count_override=cnt)
+            if self._active_resin_ranges:
                 gl.glDepthMask(False)
-                self._draw_lit("resin", mvp_active, view_dir, alpha=0.68)
+                self._draw_lit_ranges("resin_all", self._active_resin_ranges, mvp_active, view_dir, alpha=0.68)
                 gl.glDepthMask(True)
             self._draw_lit("nozzle", mvp_active, view_dir, alpha=0.95)
-            if self.show_travels:
-                self._draw_lines("travels", mvp_active, alpha=0.55, width=1.0)
+            if self.show_travels and self._active_travel_range[1] > 0:
+                self._draw_lines(
+                    "travels_all",
+                    mvp_active,
+                    alpha=0.55,
+                    width=1.0,
+                    first=self._active_travel_range[0],
+                    count_override=self._active_travel_range[1],
+                )
             if self.show_dosing:
                 self._draw_lines("dosing", mvp_active, alpha=0.95, width=1.8)
 

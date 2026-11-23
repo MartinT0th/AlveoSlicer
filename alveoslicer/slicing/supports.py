@@ -6,12 +6,12 @@ Paint-on Support Enforcers/Blockers, Dense Interfaces, and Dry-Core Roof Support
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import shapely
 import trimesh
-from shapely.geometry import LineString, Point, Polygon
+from shapely.geometry import MultiLineString, Point, Polygon
 
 from ..core.config import SlicerConfig
 from ..core.geometry import (
@@ -44,34 +44,31 @@ def _generate_dry_core_supports(
         if p_dry.is_empty:
             support_col = Polygon()
             continue
-        ceiling_here = clean_geom(safe_intersection(inner_skin_geoms[k + 1], p_dry))
+        ceiling_here = safe_intersection(inner_skin_geoms[k + 1], p_dry)
         if not ceiling_here.is_empty:
             support_col = safe_union([support_col, ceiling_here]) if not support_col.is_empty else ceiling_here
         if not support_col.is_empty:
-            support_col = clean_geom(safe_intersection(support_col, p_dry))
+            support_col = safe_intersection(support_col, p_dry)
             if not support_col.is_empty:
                 try:
-                    support_col = clean_geom(support_col.simplify(0.04, preserve_topology=True))
+                    support_col = support_col.simplify(0.04, preserve_topology=True)
                 except Exception:
                     support_col = clean_geom(support_col)
         if not support_col.is_empty and support_col.area > 0.2:
             bx0, by0, bx1, by1 = support_col.bounds
-            lines_k: List[np.ndarray] = []
+            grid_segs: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
             gx_v = math.floor(bx0 / spacing) * spacing
             while gx_v <= bx1:
-                inter = safe_intersection(support_col, LineString([(gx_v, by0 - 1.0), (gx_v, by1 + 1.0)]))
-                lines_k.extend(extract_polylines(inter))
+                grid_segs.append(((gx_v, by0 - 1.0), (gx_v, by1 + 1.0)))
                 gx_v += spacing
             gy_v = math.floor(by0 / spacing) * spacing
             while gy_v <= by1:
-                inter = safe_intersection(support_col, LineString([(bx0 - 1.0, gy_v), (bx1 + 1.0, gy_v)]))
-                lines_k.extend(extract_polylines(inter))
+                grid_segs.append(((bx0 - 1.0, gy_v), (bx1 + 1.0, gy_v)))
                 gy_v += spacing
+            lines_k = extract_polylines(safe_intersection(support_col, MultiLineString(grid_segs))) if grid_segs else []
             lines_all[k] = lines_k
             if lines_k:
-                polys_all[k] = safe_union(
-                    [safe_buffer(LineString(ln), 0.5 * lw, cap_style=2) for ln in lines_k]
-                )
+                polys_all[k] = safe_buffer(MultiLineString(lines_k), 0.5 * lw, cap_style=2, quad_segs=3)
     return lines_all, polys_all
 
 
@@ -131,20 +128,52 @@ def _extract_painted_support_regions(
     return enforcers, blockers
 
 
+def _filter_bridgeable_overhangs(
+    ov_k: shapely.Geometry,
+    prev_outer: shapely.Geometry,
+    max_bridge_span: float,
+    lw: float,
+) -> shapely.Geometry:
+    """Remove overhang islands anchored on opposite ends within ``max_bridge_span`` (printable bridges)."""
+    if ov_k.is_empty or prev_outer.is_empty:
+        return ov_k
+    anchor_zone = safe_buffer(prev_outer, lw * 1.25, join_style=2)
+    kept: List[shapely.Geometry] = []
+    for poly in iter_polygons(ov_k, min_area=0.15):
+        bx0, by0, bx1, by1 = poly.bounds
+        min_span = min(bx1 - bx0, by1 - by0)
+        if min_span <= max_bridge_span:
+            touch = safe_intersection(safe_buffer(poly, lw * 0.6), anchor_zone)
+            if not touch.is_empty:
+                n_anchors = len(iter_polygons(touch, min_area=0.05))
+                if n_anchors >= 2:
+                    continue
+                if n_anchors == 1:
+                    tb0, tb1, tb2, tb3 = touch.bounds
+                    if (bx1 - bx0 <= max_bridge_span and (tb2 - tb0) > 0.75 * (bx1 - bx0)) or (
+                        by1 - by0 <= max_bridge_span and (tb3 - tb1) > 0.75 * (by1 - by0)
+                    ):
+                        continue
+        kept.append(poly)
+    return safe_union(kept) if kept else Polygon()
+
+
 def _generate_organic_tree_supports(
     overhangs: List[shapely.Geometry],
     outer_simple: List[shapely.Geometry],
     layer_heights: List[float],
     z_gap_layers: int,
+    bot_z_gap_layers: int,
     iface_layers: int,
+    bot_iface_layers: int,
     cfg: SlicerConfig,
 ) -> Tuple[List[List[np.ndarray]], List[List[np.ndarray]]]:
     """
-    PrusaSlicer-inspired Organic Tree Supports:
-      - Clusters overhang tips into circular branches.
-      - Grows branches downward while smoothly steering outward away from the model
-        within ``support_branch_angle_deg`` and merging nearby branches into trunks.
-      - Flares trunk bases on Layer 1 for rock-solid bed adhesion.
+    PrusaSlicer-style Organic Tree Supports:
+      - Samples overhang tips and spawns sloped circular branches limited by ``support_branch_angle_deg``.
+      - Merges nearby branches smoothly only when incremental shift respects branch lean limit.
+      - Conically thickens trunks downward, steers clear of model walls, emits 1-2 perimeter hollow shells,
+        Layer-1 flared brim, and top/bottom contact interfaces.
     """
     n = len(overhangs)
     sup_lines: List[List[np.ndarray]] = [[] for _ in range(n)]
@@ -156,22 +185,21 @@ def _generate_organic_tree_supports(
     max_lean_tan = math.tan(math.radians(max(10.0, min(65.0, float(f.support_branch_angle_deg)))))
     iface_spacing = max(0.35, float(f.support_interface_spacing_mm))
     base_flare = max(0.0, float(f.support_first_layer_expansion_mm))
+    max_trunk_r = max(tip_r * 3.0, 5.5)
 
-    # Active branches: list of [cx, cy, radius]
     branches: List[List[float]] = []
 
     for k in range(n - 1, -1, -1):
         src_k = k + 1 + z_gap_layers
         if src_k < n and not overhangs[src_k].is_empty:
             for poly in iter_polygons(overhangs[src_k], min_area=0.15):
-                # Sample branch tip attachment points across larger overhangs
                 b0x, b0y, b1x, b1y = poly.bounds
                 span = max(b1x - b0x, b1y - b0y)
-                if span <= tip_r * 3.2:
+                if span <= tip_r * 3.0:
                     rp = poly.representative_point()
                     branches.append([float(rp.x), float(rp.y), tip_r])
                 else:
-                    step = max(tip_r * 2.4, 3.0)
+                    step = max(tip_r * 2.2, 2.8)
                     gx_v = b0x + 0.5 * step
                     while gx_v <= b1x:
                         gy_v = b0y + 0.5 * step
@@ -185,7 +213,9 @@ def _generate_organic_tree_supports(
         if not branches:
             continue
 
-        # Merge closely spaced branches into stronger parent trunks
+        max_shift = layer_heights[k] * max_lean_tan
+        merge_tol = max(max_shift * 2.2, tip_r * 2.2)
+
         merged: List[List[float]] = []
         used = [False] * len(branches)
         for i in range(len(branches)):
@@ -200,44 +230,52 @@ def _generate_organic_tree_supports(
                     continue
                 dx = branches[j][0] - cx
                 dy = branches[j][1] - cy
-                if math.hypot(dx, dy) <= (r + branches[j][2]) * 1.15:
+                d_ij = math.hypot(dx, dy)
+                if d_ij <= min(r + branches[j][2], merge_tol) * 1.15:
                     rj = branches[j][2]
                     wj = rj * rj
                     wx += branches[j][0] * wj
                     wy += branches[j][1] * wj
                     w_sum += wj
                     used[j] = True
-            new_r = min(max(tip_r * 2.8, 4.5), math.sqrt(w_sum) * 0.92 + 0.015 * layer_heights[k])
+            new_r = min(max_trunk_r, math.sqrt(w_sum) * 0.94 + 0.025 * layer_heights[k])
             merged.append([wx / w_sum, wy / w_sum, new_r])
         branches = merged
 
-        # Steer branches smoothly away from the model cross-section on layer k
-        excl = safe_buffer(outer_simple[k], xy_gap, join_style=1) if not outer_simple[k].is_empty else Polygon()
-        max_shift = layer_heights[k] * max_lean_tan
+        excl_parts: List[shapely.Geometry] = []
+        if not outer_simple[k].is_empty:
+            excl_parts.append(safe_buffer(outer_simple[k], xy_gap, join_style=1))
+        if not f.support_buildplate_only:
+            for d_b in range(1, bot_z_gap_layers + 1):
+                if k - d_b >= 0 and not outer_simple[k - d_b].is_empty:
+                    excl_parts.append(outer_simple[k - d_b])
+        excl = safe_union(excl_parts) if excl_parts else Polygon()
+
         kept_branches: List[List[float]] = []
         branch_polys: List[shapely.Geometry] = []
 
         for cx, cy, r in branches:
             pt = Point(cx, cy)
-            if not excl.is_empty and excl.distance(pt) < r + 0.1:
-                # Push radially away from nearest model boundary
-                try:
-                    b_pt = shapely.ops.nearest_points(pt, excl.boundary)[1]
-                    vx, vy = cx - float(b_pt.x), cy - float(b_pt.y)
-                    if excl.contains(pt):
-                        vx, vy = -vx, -vy
-                    vl = math.hypot(vx, vy)
-                    if vl > 1e-6:
-                        cx += (vx / vl) * max_shift
-                        cy += (vy / vl) * max_shift
-                except Exception:
-                    pass
-            r_eff = r + (base_flare if k == 0 else (base_flare * 0.4 if k == 1 else 0.0))
+            if not outer_simple[k].is_empty:
+                m_excl = excl_parts[0]
+                if m_excl.distance(pt) < r + 0.1:
+                    try:
+                        b_pt = shapely.ops.nearest_points(pt, m_excl.boundary)[1]
+                        vx, vy = cx - float(b_pt.x), cy - float(b_pt.y)
+                        if m_excl.contains(pt):
+                            vx, vy = -vx, -vy
+                        vl = math.hypot(vx, vy)
+                        if vl > 1e-6:
+                            cx += (vx / vl) * max_shift
+                            cy += (vy / vl) * max_shift
+                    except Exception:
+                        pass
+            r_eff = r + (base_flare if k == 0 else (base_flare * 0.45 if k == 1 else 0.0))
             circ = Point(cx, cy).buffer(r_eff, quad_segs=14)
             circ_clean = safe_difference(circ, excl) if not excl.is_empty else circ
             if not circ_clean.is_empty and circ_clean.area > 0.15:
                 branch_polys.append(circ_clean)
-                kept_branches.append([cx, cy, r + 0.012 * layer_heights[k]])
+                kept_branches.append([cx, cy, min(max_trunk_r, r + 0.025 * layer_heights[k])])
             elif not f.support_buildplate_only:
                 kept_branches.append([cx, cy, r])
         branches = kept_branches
@@ -246,26 +284,34 @@ def _generate_organic_tree_supports(
             continue
 
         tree_geom = safe_union(branch_polys)
-        # Emit hollow 2-perimeter organic shell rings (fast & easy to snap off!)
         for poly in iter_polygons(tree_geom, min_area=0.15):
             outer_ring = safe_buffer(poly, -0.5 * lw_sup, join_style=1)
             for p_ring in iter_polygons(outer_ring, min_area=0.05):
                 sup_lines[k].append(np.asarray(p_ring.exterior.coords, dtype=np.float64))
+            # Second concentric hollow ring on wide trunks for rigidity
+            if poly.area > math.pi * (lw_sup * 2.5) ** 2:
+                inner_ring = safe_buffer(outer_ring, -lw_sup, join_style=1)
+                for p_ring in iter_polygons(inner_ring, min_area=0.05):
+                    sup_lines[k].append(np.asarray(p_ring.exterior.coords, dtype=np.float64))
             if k == 0:
-                # Solid adhesion disk on Layer 1
                 sup_lines[k].extend(_hatch_polygon(outer_ring, lw_sup * 1.1, 45.0))
 
-        # Top interface pads right below overhang tips
+        iface_acc: List[shapely.Geometry] = []
         if iface_layers > 0:
-            iface_acc = [
-                overhangs[k + z_gap_layers + d_i]
-                for d_i in range(1, iface_layers + 1)
-                if (k + z_gap_layers + d_i) < n and not overhangs[k + z_gap_layers + d_i].is_empty
-            ]
-            if iface_acc:
-                i_geom = clean_geom(safe_intersection(safe_union(iface_acc), tree_geom))
-                if not i_geom.is_empty and i_geom.area > 0.15:
-                    iface_lines[k].extend(_hatch_polygon(i_geom, iface_spacing, 45.0 if k % 2 == 0 else -45.0))
+            for d_i in range(1, iface_layers + 1):
+                if (k + z_gap_layers + d_i) < n and not overhangs[k + z_gap_layers + d_i].is_empty:
+                    iface_acc.append(overhangs[k + z_gap_layers + d_i])
+        if bot_iface_layers > 0 and not f.support_buildplate_only and k >= 1:
+            for d_i in range(1, bot_iface_layers + 1):
+                bi = k - bot_z_gap_layers - d_i
+                if bi >= 0 and not outer_simple[bi].is_empty:
+                    on_model = safe_intersection(tree_geom, outer_simple[bi])
+                    if not on_model.is_empty and on_model.area > 0.2:
+                        iface_acc.append(on_model)
+        if iface_acc:
+            i_geom = safe_intersection(safe_union(iface_acc), tree_geom)
+            if not i_geom.is_empty and i_geom.area > 0.15:
+                iface_lines[k].extend(_hatch_polygon(i_geom, iface_spacing, 45.0 if k % 2 == 0 else -45.0))
 
     return sup_lines, iface_lines
 
@@ -280,9 +326,10 @@ def _generate_external_supports(
     """
     Generate PrusaSlicer-style external overhang support structures + dense interface layers:
       - Integrates Paint-on Support Enforcers (+1) and Blockers (-1) from ``mesh.metadata``.
-      - Supports ``auto`` and ``enforcers_only`` modes.
+      - Supports ``auto`` and ``enforcers_only`` modes, plus ``dont_support_bridges``.
+      - Respects both ``support_z_distance_mm`` (top) and ``support_bottom_z_distance_mm`` (bottom).
       - Supports ``grid``, ``snug``, ``organic`` (tree), and ``pillars`` styles, plus
-        ``rectilinear``, ``rectilinear_grid``, and ``honeycomb`` patterns & bottom interfaces.
+        ``rectilinear``, ``rectilinear_grid``, and ``honeycomb`` patterns & top/bottom interfaces.
     """
     n = len(outer_polys)
     sup_lines: List[List[np.ndarray]] = [[] for _ in range(n)]
@@ -294,12 +341,15 @@ def _generate_external_supports(
     angle_deg = max(5.0, min(85.0, float(f.support_overhang_angle_deg)))
     tan_a = math.tan(math.radians(angle_deg))
     xy_gap = max(0.1, float(f.support_xy_distance_mm))
-    z_gap_layers = max(0, int(round(f.support_z_distance_mm / max(0.05, f.layer_height))))
+    nom_h = max(0.05, float(f.layer_height))
+    z_gap_layers = max(0, int(round(f.support_z_distance_mm / nom_h)))
+    bot_z_gap_layers = max(0, int(round(f.support_bottom_z_distance_mm / nom_h)))
     iface_layers = max(0, int(f.support_interface_layers))
     bot_iface_layers = max(0, int(f.support_bottom_interface_layers))
     sup_spacing = max(0.8, float(f.support_spacing_mm))
     iface_spacing = max(0.35, float(f.support_interface_spacing_mm))
     lw_sup = max(0.2, float(f.support_line_width or f.line_width))
+    max_bridge_span = max(3.0, float(getattr(cfg.infill, "max_bridge_span", 8.0)))
 
     # 0. Extract Paint-on Support enforcer/blocker polygons if present on mesh
     if mesh is not None and z_mids is not None:
@@ -308,7 +358,7 @@ def _generate_external_supports(
         enforcers = [Polygon() for _ in range(n)]
         blockers = [Polygon() for _ in range(n)]
 
-    # 1. Identify overhanging areas per layer (combining auto overhangs + enforcers - blockers)
+    # 1. Identify overhanging areas per layer (combining auto overhangs - bridges + enforcers - blockers)
     overhangs: List[shapely.Geometry] = [Polygon() for _ in range(n)]
     has_any_overhang = False
     max_ov_layer = 0
@@ -326,15 +376,15 @@ def _generate_external_supports(
             if not ov.is_empty and ov.area > 0.25:
                 ov_clean = safe_buffer(safe_buffer(ov, -0.15 * lw_sup), 0.15 * lw_sup)
                 if not ov_clean.is_empty and ov_clean.area > 0.20:
+                    if f.support_dont_support_bridges and not p_prev.is_empty:
+                        ov_clean = _filter_bridgeable_overhangs(ov_clean, p_prev, max_bridge_span, lw_sup)
                     ov_k = ov_clean
 
-        # Merge painted Enforcers (+1) clipped to this layer's model footprint
         if not enforcers[k].is_empty:
-            enf_here = clean_geom(safe_intersection(p_cur, enforcers[k]))
+            enf_here = safe_intersection(p_cur, enforcers[k])
             if not enf_here.is_empty:
                 ov_k = safe_union([ov_k, enf_here]) if not ov_k.is_empty else enf_here
 
-        # Subtract painted Blockers (-1)
         if not ov_k.is_empty and not blockers[k].is_empty:
             ov_k = safe_difference(ov_k, blockers[k])
 
@@ -361,14 +411,15 @@ def _generate_external_supports(
             except Exception:
                 outer_simple.append(clean_geom(p))
 
-    # Organic tree support style
     if f.support_style == "organic":
         return _generate_organic_tree_supports(
             overhangs=overhangs,
             outer_simple=outer_simple,
             layer_heights=layer_heights,
             z_gap_layers=z_gap_layers,
+            bot_z_gap_layers=bot_z_gap_layers,
             iface_layers=iface_layers,
+            bot_iface_layers=bot_iface_layers,
             cfg=cfg,
         )
 
@@ -406,13 +457,20 @@ def _generate_external_supports(
         if active_col.is_empty:
             continue
 
-        excl = safe_buffer(outer_simple[k], xy_gap, join_style=2) if not outer_simple[k].is_empty else Polygon()
+        excl_parts: List[shapely.Geometry] = []
+        if not outer_simple[k].is_empty:
+            excl_parts.append(safe_buffer(outer_simple[k], xy_gap, join_style=2))
         if f.support_buildplate_only and not below_union[k].is_empty:
-            excl = clean_geom(
-                safe_union([excl, safe_buffer(below_union[k], xy_gap, join_style=2)]).simplify(
-                    0.05, preserve_topology=True
-                )
-            )
+            excl_parts.append(safe_buffer(below_union[k], xy_gap, join_style=2))
+        elif (not f.support_buildplate_only) and bot_z_gap_layers > 0:
+            for d_b in range(1, bot_z_gap_layers + 1):
+                if k - d_b >= 0 and not outer_simple[k - d_b].is_empty:
+                    excl_parts.append(outer_simple[k - d_b])
+        excl = (
+            clean_geom(safe_union(excl_parts).simplify(0.05, preserve_topology=True))
+            if excl_parts
+            else Polygon()
+        )
 
         here = safe_difference(active_col, excl) if not excl.is_empty else active_col
         if here.is_empty or here.area < 0.25:
@@ -427,24 +485,22 @@ def _generate_external_supports(
         here = clean_geom(here.simplify(0.05, preserve_topology=True))
         col_geoms[k] = here
 
-        # Top interface layers directly below overhang ceiling
         iface_acc: List[shapely.Geometry] = []
         if iface_layers > 0:
             for d_i in range(1, iface_layers + 1):
                 ov_idx = k + z_gap_layers + d_i
                 if ov_idx < n and not overhangs[ov_idx].is_empty:
                     iface_acc.append(overhangs[ov_idx])
-        # Bottom interface layers resting on model top surfaces
         if bot_iface_layers > 0 and not f.support_buildplate_only and k >= 1:
             for d_i in range(1, bot_iface_layers + 1):
-                bi = k - d_i
+                bi = k - bot_z_gap_layers - d_i
                 if bi >= 0 and not outer_simple[bi].is_empty:
-                    on_model = clean_geom(safe_intersection(here, outer_simple[bi]))
+                    on_model = safe_intersection(here, outer_simple[bi])
                     if not on_model.is_empty and on_model.area > 0.2:
                         iface_acc.append(on_model)
 
         if iface_acc:
-            i_geom = clean_geom(safe_intersection(safe_union(iface_acc), here))
+            i_geom = safe_intersection(safe_union(iface_acc), here)
             if not i_geom.is_empty and i_geom.area > 0.2:
                 iface_geoms[k] = clean_geom(i_geom.simplify(0.05, preserve_topology=True))
 
@@ -464,7 +520,7 @@ def _generate_external_supports(
             if f.support_pattern == "honeycomb":
                 sup_lines[k].extend(_honeycomb_hatch_polygon(body_geom, sup_spacing))
             else:
-                angle = 0.0 if (f.support_style != "pillars" or k % 2 == 0) else 90.0
+                angle = 0.0 if (f.support_style not in ("snug", "pillars") or k % 2 == 0) else 90.0
                 sup_lines[k].extend(_hatch_polygon(body_geom, sup_spacing, angle))
                 if f.support_pattern == "rectilinear_grid" or f.support_style == "grid":
                     sup_lines[k].extend(_hatch_polygon(body_geom, sup_spacing * 2.0, 90.0))

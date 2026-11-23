@@ -366,7 +366,7 @@ def build_bed_geometry(
         tgt.append([b[0], b[1], b[2], c[0], c[1], c[2]])
 
     minor_c, major_c = pal.gl_grid_minor, pal.gl_grid_major
-    border_act, border_inact, cage_c = (0.96, 0.78, 0.14), pal.gl_grid_border, pal.gl_cage
+    border_act, border_inact, cage_c = pal.gl_grid_border, pal.gl_grid_major, pal.gl_cage
 
     if bed_shape == "circular":
         rad, cx, cy, n_seg = 0.5 * min(bx, by), 0.5 * bx, 0.5 * by, 64
@@ -487,7 +487,7 @@ def build_cut_plane_geometry(
     p11 = origin + half_size * u + half_size * v
     p01 = origin - half_size * u + half_size * v
 
-    col_q, nf = (0.98, 0.82, 0.14), n.astype(np.float32)
+    col_q, nf = (0.961, 0.722, 0.180), n.astype(np.float32)
     quad = np.array([
         [*p00, *nf, *col_q], [*p10, *nf, *col_q], [*p11, *nf, *col_q],
         [*p00, *nf, *col_q], [*p11, *nf, *col_q], [*p01, *nf, *col_q],
@@ -497,9 +497,9 @@ def build_cut_plane_geometry(
 
     handle = trimesh.creation.icosphere(subdivisions=1, radius=max(2.0, half_size * 0.065))
     handle.apply_translation(origin)
-    lit_cpu = np.vstack([quad, mesh_to_lit_buffer(handle, (1.0, 0.90, 0.25))])
+    lit_cpu = np.vstack([quad, mesh_to_lit_buffer(handle, (0.984, 0.788, 0.314))])
 
-    fc, nc = (1.0, 0.88, 0.18), (0.12, 0.88, 1.0)
+    fc, nc = (0.961, 0.722, 0.180), (0.506, 0.549, 0.973)
     lines = np.asarray([
         [*p00, *fc], [*p10, *fc], [*p10, *fc], [*p11, *fc],
         [*p11, *fc], [*p01, *fc], [*p01, *fc], [*p00, *fc],

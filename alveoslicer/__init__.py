@@ -59,6 +59,8 @@ _LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
     # Config
     "CELL_PATTERNS": (".core", "CELL_PATTERNS"),
     "INFILL_ENGINES": (".core", "INFILL_ENGINES"),
+    "SLICING_GENERATORS": (".core", "SLICING_GENERATORS"),
+    "PRINTER_CAPABILITIES": (".core", "PRINTER_CAPABILITIES"),
     "STANDARD_INFILL_PATTERNS": (".core", "STANDARD_INFILL_PATTERNS"),
     "TOP_BOTTOM_FILL_PATTERNS": (".core", "TOP_BOTTOM_FILL_PATTERNS"),
     "BRIM_TYPES": (".core", "BRIM_TYPES"),

@@ -15,7 +15,12 @@ from .gcode.hal import create_hal
 from .gcode.toolpath import generate_fff_paths_for_layer
 from .hybrid.dosing import DosingPoint, plan_cycle_dosing
 from .hybrid.scheduler import CureCycle, compute_optimal_cure_schedule
-from .infill import Capsule, NormalVoronoiLattice, generate_normal_dendritic_infill
+from .infill import (
+    Capsule,
+    NormalVoronoiLattice,
+    generate_cellular_infill_for_mesh,
+    generate_normal_dendritic_infill,
+)
 from .infill.lattice import combine_lattices
 from .slicing import SlicedLayer, slice_model_to_layers
 
@@ -77,13 +82,15 @@ def slice_mesh(
         _log(f"[Scene] Detected {n_bodies} independent solid bodies — synthesizing & slicing each separately.")
 
     body_lattices: List[NormalVoronoiLattice] = []
-    if str(cfg.infill.infill_engine).lower() == "standard":
+    use_standard = (str(cfg.infill.infill_engine).lower() == "standard") or (not cfg.is_hybrid_printer)
+    gen_name = str(getattr(cfg.infill, "slicing_generator", "mesh_direct")).lower()
+    if use_standard:
         _progress(22, "Stage 2-3: Preparing Standard PrusaSlicer Infill engine...")
         _log(
             f"[Stage 2-3] Using Standard PrusaSlicer Infill engine "
             f"(pattern={cfg.infill.standard_fill_pattern}, density={cfg.infill.fill_density_pct:.1f}%)..."
         )
-        field = VolumetricField(resolved_bodies[0], pitch=max(1.2, cfg.voxel_pitch_mm))
+        field = None
         for _ in resolved_bodies:
             body_lattices.append(
                 NormalVoronoiLattice(
@@ -93,13 +100,14 @@ def slice_mesh(
                     seed_z_bounds=np.zeros((0, 2), dtype=np.float64),
                     pattern=cfg.infill.standard_fill_pattern,
                     pitch=cfg.infill.target_cell_pitch,
+                    generator="standard",
                 )
             )
         lattice = body_lattices[0]
     else:
         _log(
             f"[Stage 1-2] Synthesizing 3D outer-surface {cfg.infill.pattern} pattern "
-            f"(mode={cfg.infill.mode}, pitch={cfg.infill.target_cell_pitch} mm, "
+            f"(generator={gen_name}, mode={cfg.infill.mode}, pitch={cfg.infill.target_cell_pitch} mm, "
             f"resin_channel={cfg.infill.min_channel_clearance} mm, "
             f"flatten_angle=<{cfg.infill.flatten_angle_deg} deg) across {n_bodies} body/bodies..."
         )
@@ -107,17 +115,19 @@ def slice_mesh(
         for b_idx, b_mesh in enumerate(resolved_bodies):
             pct = 5 + int(32 * b_idx / max(1, n_bodies))
             label = f"body {b_idx + 1}/{n_bodies}" if n_bodies > 1 else "model"
-            _progress(pct, f"Stage 1-2: Synthesizing 3D cellular lattice ({label})...")
-            b_field = VolumetricField(b_mesh, pitch=cfg.voxel_pitch_mm)
-            if field is None:
-                field = b_field
-            b_lattice = generate_normal_dendritic_infill(b_field, cfg)
+            _progress(pct, f"Stage 1-2: Synthesizing cellular lattice ({gen_name}, {label})...")
+            if gen_name == "voxel_sdf":
+                b_field = VolumetricField(b_mesh, pitch=cfg.voxel_pitch_mm)
+                if field is None:
+                    field = b_field
+                b_lattice = generate_normal_dendritic_infill(b_field, cfg)
+            else:
+                b_lattice = generate_cellular_infill_for_mesh(b_mesh, cfg, field=None)
             body_lattices.append(b_lattice)
             _log(
-                f"            Body {b_idx + 1}/{n_bodies}: placed {len(b_lattice.seeds)} cells "
-                f"({len(b_lattice)} 3D wireframe edges)."
+                f"            Body {b_idx + 1}/{n_bodies}: placed {len(b_lattice.seeds)} seeds "
+                f"({len(b_lattice)} 3D wireframe edges, generator={gen_name})."
             )
-        assert field is not None
         lattice = combine_lattices(
             body_lattices,
             pattern=cfg.infill.pattern,
@@ -139,7 +149,7 @@ def slice_mesh(
     )
     _log(f"          Sliced {len(layers)} exact vector layers.")
 
-    if cfg.hybrid.is_fff_only:
+    if cfg.effective_is_fff_only:
         _progress(65, "Stage 4: Standard FFF mode (resin & UV disabled)...")
         _log("[Stage 4] Standard FFF-only mode active: skipping photopolymer dosing & UV cure cycles.")
         schedule: List[CureCycle] = []
@@ -166,14 +176,20 @@ def slice_mesh(
 
     for idx, ly in enumerate(layers):
         fff_paths = generate_fff_paths_for_layer(ly, xs, ys, cfg)
-        hal.emit_fff_layer(ly.layer_idx, ly.z, fff_paths, layer_height=ly.layer_height)
+        hal.emit_fff_layer(
+            ly.layer_idx,
+            ly.z,
+            fff_paths,
+            layer_height=ly.layer_height,
+            outer_geom=ly.outer_geom,
+        )
 
-        if (not cfg.hybrid.is_fff_only) and (ly.layer_idx in cycle_by_layer):
+        if (not cfg.effective_is_fff_only) and (ly.layer_idx in cycle_by_layer):
             cycle = cycle_by_layer[ly.layer_idx]
             dosing_pts, bbox_xy = plan_cycle_dosing(layers, cycle, xs, ys, cfg)
             dosing_by_layer[ly.layer_idx] = dosing_pts
-            if dosing_pts or cfg.hybrid.enable_uv_curing:
-                if cfg.hybrid.enable_resin_pumping:
+            if dosing_pts or cfg.effective_uv_curing:
+                if cfg.effective_resin_pumping:
                     total_resin_mm3 += sum(d.volume_mm3 for d in dosing_pts)
                 hal.emit_resin_and_uv_cycle(cycle, ly.z, dosing_pts, bbox_xy)
 

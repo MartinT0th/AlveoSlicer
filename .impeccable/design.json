@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-23T11:47:00+01:00",
+  "title": "Design System: AlveoSlicer",
+  "extensions": {
+    "colorMeta": {
+      "glacial-teal-dark": {
+        "role": "primary",
+        "displayName": "Glacial Teal (Dark)",
+        "canonical": "#2dd4bf",
+        "tonalRamp": ["#042f2e", "#115e59", "#0f766e", "#0d9488", "#14b8a6", "#2dd4bf", "#5eead4", "#ccfbf1"]
+      },
+      "glacial-teal-light": {
+        "role": "primary",
+        "displayName": "Glacial Teal (Light)",
+        "canonical": "#0f766e",
+        "tonalRamp": ["#042f2e", "#134e4a", "#115e59", "#0f766e", "#0d9488", "#14b8a6", "#5eead4", "#f0fdfa"]
+      },
+      "ultraviolet-indigo-dark": {
+        "role": "secondary",
+        "displayName": "Ultraviolet Indigo (Dark)",
+        "canonical": "#818cf8",
+        "tonalRamp": ["#1e1b4b", "#312e81", "#3730a3", "#4f46e5", "#6366f1", "#818cf8", "#a5b4fc", "#e0e7ff"]
+      },
+      "optical-flint-base": {
+        "role": "neutral",
+        "displayName": "Optical Flint",
+        "canonical": "#0e1217",
+        "tonalRamp": ["#090c10", "#0b0f14", "#0e1217", "#151b23", "#1c2430", "#222b37", "#313e50", "#8797ab"]
+      },
+      "quartz-paper-base": {
+        "role": "neutral",
+        "displayName": "Quartz Paper",
+        "canonical": "#f2f5f8",
+        "tonalRamp": ["#131a24", "#354355", "#55667a", "#b2c2d3", "#d2dce6", "#e6ecf2", "#f2f5f8", "#ffffff"]
+      }
+    },
+    "typographyMeta": {
+      "display": { "displayName": "Display", "purpose": "Startup splash wordmark." },
+      "title": { "displayName": "Title", "purpose": "Settings card headings and primary button labels." },
+      "body": { "displayName": "Body", "purpose": "Standard desktop UI chrome, tabs, and form labels." },
+      "label": { "displayName": "Label", "purpose": "Uppercase compact sidebar shelf headers and stat captions." },
+      "mono": { "displayName": "Monospace Telemetry", "purpose": "Spinboxes, layer/Z counters, slice stats, and G-code previews." }
+    },
+    "shadows": [
+      { "name": "flat-hairline", "value": "none", "purpose": "Flat tonal layering with 1px structural borders; no stacked drop shadows." }
+    ],
+    "motion": [
+      { "name": "instant-hover", "value": "0ms", "purpose": "Crisp desktop CAD feedback on hover, check, and tab transitions." }
+    ],
+    "breakpoints": [
+      { "name": "desktop-compact", "value": "1380px" },
+      { "name": "desktop-wide", "value": "1540px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Action Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "High-contrast glacial-teal action button reserved for Slice Plate and Perform Cut.",
+      "html": "<button class=\"ds-btn-primary\">Slice Plate</button>",
+      "css": ".ds-btn-primary { background: #2dd4bf; color: #061314; border: 1px solid #2dd4bf; border-radius: 7px; padding: 9px 18px; font: 700 13px 'Segoe UI', sans-serif; cursor: pointer; } .ds-btn-primary:hover { background: #5eead4; border-color: #5eead4; } .ds-btn-primary:active { background: #14b8a6; }"
+    },
+    {
+      "name": "Segmented Mode Pill",
+      "kind": "nav",
+      "refersTo": "button-secondary",
+      "description": "Top-right segmented switch for Simple/Advanced mode and Dark/Light/System theme.",
+      "html": "<div class=\"ds-seg\"><button class=\"ds-seg-btn ds-active\">Simple</button><button class=\"ds-seg-btn\">Advanced</button></div>",
+      "css": ".ds-seg { display: inline-flex; gap: 2px; padding: 2px; background: #151b23; border: 1px solid #222b37; border-radius: 7px; } .ds-seg-btn { background: transparent; color: #8797ab; border: 1px solid transparent; border-radius: 5px; padding: 4px 10px; font: 600 11px 'Segoe UI', sans-serif; cursor: pointer; } .ds-seg-btn:hover { background: #1c2430; color: #e8eef5; } .ds-seg-btn.ds-active { background: #2dd4bf; color: #061314; font-weight: 700; }"
+    },
+    {
+      "name": "Numeric Spinbox Input",
+      "kind": "input",
+      "refersTo": "input-numeric",
+      "description": "Capped-width obsidian monospace input used across settings cards.",
+      "html": "<input class=\"ds-input-num\" value=\"0.20 mm\" />",
+      "css": ".ds-input-num { width: 156px; background: #0b0f14; color: #e8eef5; border: 1px solid #313e50; border-radius: 6px; padding: 5px 10px; font: 600 11.5px 'Cascadia Mono', Consolas, monospace; outline: none; } .ds-input-num:hover { border-color: #8797ab; } .ds-input-num:focus { border-color: #2dd4bf; }"
+    },
+    {
+      "name": "UV Cure Badge",
+      "kind": "chip",
+      "refersTo": "badge-uv",
+      "description": "Semantic ultraviolet-indigo status badge marking hybrid curing mode and active UV cure layers.",
+      "html": "<span class=\"ds-uv-badge\">UV CURE</span>",
+      "css": ".ds-uv-badge { display: inline-block; background: rgba(129, 140, 248, 0.16); color: #a5b4fc; border: 1px solid rgba(129, 140, 248, 0.48); border-radius: 5px; padding: 3px 8px; font: 700 10px 'Segoe UI', sans-serif; letter-spacing: 0.04em; }"
+    },
+    {
+      "name": "Flat Settings Card",
+      "kind": "card",
+      "refersTo": "card-surface",
+      "description": "Flat mineral-slate settings container with a bold header and 1px hairline separator.",
+      "html": "<div class=\"ds-card\"><div class=\"ds-card-hdr\">Layer Height</div><div class=\"ds-card-div\"></div><div class=\"ds-card-body\">Layer height: 0.20 mm</div></div>",
+      "css": ".ds-card { background: #151b23; border: 1px solid #222b37; border-radius: 8px; padding: 12px 16px 14px; color: #e8eef5; font: 400 12px 'Segoe UI', sans-serif; max-width: 340px; } .ds-card-hdr { font: 700 12.5px 'Segoe UI', sans-serif; margin-bottom: 10px; } .ds-card-div { height: 1px; background: #222b37; margin-bottom: 10px; } .ds-card-body { color: #b6c3d2; }"
+    },
+    {
+      "name": "Optical UV Cure Cadence Strip",
+      "kind": "custom",
+      "refersTo": "badge-uv",
+      "description": "Compact optical cadence bar visualizing FFF layer span and scheduled ultraviolet cure pulses.",
+      "html": "<div class=\"ds-cadence\"><span style=\"left:12%\"></span><span style=\"left:28%\"></span><span style=\"left:44%\"></span><span style=\"left:60%\"></span><span style=\"left:76%\"></span><span style=\"left:90%\"></span></div>",
+      "css": ".ds-cadence { position: relative; height: 10px; width: 260px; background: #0b0f14; border-radius: 4px; overflow: hidden; } .ds-cadence::before { content: ''; position: absolute; inset: 1px; background: rgba(45, 212, 191, 0.28); border-radius: 3px; } .ds-cadence span { position: absolute; top: 1px; bottom: 1px; width: 3px; background: #818cf8; border-radius: 1px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Optical Glass Lab",
+    "overview": "AlveoSlicer treats hybrid FFF and photopolymer slicing like a precision laboratory optical bench. The 3D OpenGL build plate owns the visual center of the application, framed by quiet optical-flint dark surfaces (and crisp quartz-paper surfaces in Light mode) so geometry, toolpaths, and translucent resin channels stay immediately legible without competing chrome.\n\nColor is rationed strictly to active states and physical meaning: glacial teal marks the primary action, active plate, and focused selection, while ultraviolet indigo is reserved exclusively for photopolymer curing cycles, UV markers, and hybrid mode semantics. Everything at rest recedes into calm mineral slate and hairline dividers.",
+    "keyCharacteristics": [
+      "Dark-first optical-flint workspace with a full, first-class quartz-paper Light mode and OS System tracking.",
+      "Strict active-only accent discipline separating interactive glacial teal from UV-curing ultraviolet indigo.",
+      "Monospace numeric precision for coordinates, layer counters, Z heights, telemetry, and G-code views.",
+      "Progressive complexity via a global Simple / Advanced toggle that keeps essential controls scannable without disconnecting any configuration binding.",
+      "Compact, capped-width settings forms and zero-clipping sidebar shelves engineered for desktop monitors."
+    ],
+    "rules": [
+      {
+        "name": "The Active-Only Accent Rule",
+        "body": "Inactive chrome, unselected beds, and rest-state controls stay neutral. Glacial teal appears only on the primary call to action, active mode/tool pills, and focused fields; ultraviolet indigo appears only where photopolymer or UV curing is active.",
+        "section": "colors"
+      },
+      {
+        "name": "The Dual-Theme Parity Rule",
+        "body": "Every custom widget — including the 3D OpenGL bed, vertical layer slider, cure cadence strip, and Matplotlib 2D Basin Inspector — reads its colors from ThemePalette via get_palette(resolved_mode) with zero hardcoded dark-only stylesheets.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tabular Numerics Rule",
+        "body": "All mutable numeric readouts and engineering spinboxes use the monospace stack so values never jump horizontally while scrubbing layers or dragging objects.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-By-Default Rule",
+        "body": "Cards and shelves sit flat with 1px structural borders; depth is communicated through surface step contrast and translucent overlay framing rather than stacked card shadows.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do source every Qt, Matplotlib, and OpenGL color from ThemePalette (get_palette(resolved_mode)) so Dark and Light modes stay strictly synchronized.",
+      "Do cap settings input widths (156px spinboxes, <=280px combos, <=820px page column) and use QSizePolicy.Ignored horizontally on sidebar inputs to prevent clipping.",
+      "Do reserve ultraviolet indigo exclusively for photopolymer and UV curing states, and glacial teal for primary/active interaction states.",
+      "Do implement Simple/Advanced filtering purely via visibility (setVisible / setHidden) so all SlicerConfig field bindings remain registered and testable."
+    ],
+    "donts": [
+      "Don't place a thick one-sided left border bar (border-left: 3px solid ...) on rounded sidebar or list items; use a full subtle rounded pill border instead.",
+      "Don't hardcode dark hex colors inside view widgets (inspector_2d.py, schedule_view.py, layer_slider.py) or bypass build_stylesheet.",
+      "Don't stretch settings inputs across the full viewport width or nest bordered cards inside bordered cards.",
+      "Don't import PySide6 or matplotlib outside alveoslicer/ui/."
+    ]
+  }
+}

@@ -30,6 +30,8 @@ CELL_PATTERNS = (
     "cubic",
 )
 INFILL_ENGINES = ("surface_normal_3d", "standard")
+SLICING_GENERATORS = ("mesh_direct", "analytic_hex", "planar_25d", "voxel_sdf")
+PRINTER_CAPABILITIES = ("hybrid", "fff_only")
 STANDARD_INFILL_PATTERNS = (
     "rectilinear",
     "aligned_rectilinear",
@@ -219,6 +221,7 @@ class InfillSettings:
 
     # Standard PrusaSlicer Infill Engine
     infill_engine: str = "surface_normal_3d"        # "surface_normal_3d" or "standard"
+    slicing_generator: str = "mesh_direct"          # "mesh_direct", "analytic_hex", "planar_25d", or "voxel_sdf"
     fill_density_pct: float = 15.0                  # 0..100 % sparse infill density
     standard_fill_pattern: str = "gyroid"           # One of STANDARD_INFILL_PATTERNS
     top_fill_pattern: str = "monotonic"             # Top solid fill pattern
@@ -295,6 +298,7 @@ class UVSettings:
 class PrinterProfile:
     """Machine kinematics, build volume, motion limits, custom G-code hooks, and hybrid offsets."""
 
+    printer_capability: str = "hybrid"              # "hybrid" or "fff_only"
     printer_type: str = "bedslinger_prototype"      # "bedslinger_prototype" or "corexy_toolchanger"
     gcode_flavor: str = "marlin2"                   # "marlin2", "klipper", "prusa", or "reprap"
     bed_shape: str = "rectangular"                  # "rectangular" or "circular"
@@ -366,6 +370,26 @@ class SlicerConfig:
     uv: UVSettings = field(default_factory=UVSettings)
     printer: PrinterProfile = field(default_factory=PrinterProfile)
     hybrid: HybridSettings = field(default_factory=HybridSettings)
+
+    @property
+    def is_hybrid_printer(self) -> bool:
+        """Return True when the active printer supports photopolymer pumping / UV curing."""
+        return str(self.printer.printer_capability).lower() != "fff_only"
+
+    @property
+    def effective_resin_pumping(self) -> bool:
+        """Return True when both printer hardware capability and process toggle allow resin pumping."""
+        return self.is_hybrid_printer and self.hybrid.enable_resin_pumping
+
+    @property
+    def effective_uv_curing(self) -> bool:
+        """Return True when both printer hardware capability and process toggle allow UV curing."""
+        return self.is_hybrid_printer and self.hybrid.enable_uv_curing
+
+    @property
+    def effective_is_fff_only(self) -> bool:
+        """Return True when output should be strictly single-material standard FFF G-code."""
+        return (not self.effective_resin_pumping) and (not self.effective_uv_curing)
 
     def to_json(self, path: Union[str, Path]) -> None:
         """Serialize the complete configuration to a formatted JSON file."""

@@ -24,12 +24,11 @@ class CoreXYToolchangerHAL(GCodeHAL):
         r = self.cfg.resin
         u = self.cfg.uv
         f = self.cfg.fff
-        hyb = self.cfg.hybrid
-        if hyb.is_fff_only:
+        if self.cfg.effective_is_fff_only:
             return
 
-        do_pump = hyb.enable_resin_pumping and bool(dosing_points)
-        do_uv = hyb.enable_uv_curing
+        do_pump = self.cfg.effective_resin_pumping and bool(dosing_points)
+        do_uv = self.cfg.effective_uv_curing
         if not do_pump and not do_uv:
             return
 

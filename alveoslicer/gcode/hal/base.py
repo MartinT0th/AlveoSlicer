@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -47,6 +47,9 @@ class GCodeHAL:
         self._active_type: Optional[str] = None
         self._active_width: Optional[float] = None
         self._active_accel: Optional[int] = None
+        self._active_fan_pwm: int = -1
+        self._retracted: bool = False
+        self._last_printed_seg: Optional[Tuple[float, float, float, float]] = None
 
         h = cfg.fff.layer_height
         w = cfg.fff.line_width
@@ -87,6 +90,12 @@ class GCodeHAL:
             self.emit(f"M204 S{val}")
             self._active_accel = val
 
+    def _set_fan_pwm(self, pwm: int) -> None:
+        val = max(0, min(255, int(round(pwm))))
+        if val != self._active_fan_pwm:
+            self.emit("M107" if val == 0 else f"M106 S{val}")
+            self._active_fan_pwm = val
+
     def _e_per_mm(self, width_mm: float, height_mm: float, flow_scale: float = 1.0) -> float:
         w = max(0.08, float(width_mm))
         h = max(0.05, float(height_mm))
@@ -94,94 +103,108 @@ class GCodeHAL:
         return self.cfg.fff.flow_multiplier * flow_scale * (a_line / self.fil_area_mm2)
 
     def _feature_params(self, tag: str, layer_idx: int) -> Tuple[float, float, float, float]:
-        """Return (width_mm, speed_mm_s, flow_scale, accel_mm_s2) for a toolpath tag."""
+        """Return (width_mm, speed_mm_s, flow_scale, accel_mm_s2) for a toolpath tag clamped to machine limits."""
         f = self.cfg.fff
+        p = self.cfg.printer
+        max_xy_spd = max(10.0, min(float(p.max_feedrate_x_mm_s), float(p.max_feedrate_y_mm_s)))
+        max_xy_acc = max(100.0, min(float(p.max_accel_x_mm_s2), float(p.max_accel_y_mm_s2)))
         is_first = layer_idx == 1
         lw_def = max(0.15, float(f.line_width))
         if is_first:
             w = max(0.15, float(f.first_layer_line_width or lw_def))
-            spd = max(5.0, float(f.first_layer_speed_mm_s))
-            acc = float(f.first_layer_accel_mm_s2 or f.default_accel_mm_s2)
+            spd = min(max_xy_spd, max(5.0, float(f.first_layer_speed_mm_s)))
+            acc = min(max_xy_acc, float(f.first_layer_accel_mm_s2 or f.default_accel_mm_s2))
             return w, spd, 1.0, acc
 
+        if tag == "BRIDGE":
+            return (
+                lw_def,
+                min(max_xy_spd, max(5.0, float(f.bridge_speed_mm_s))),
+                max(0.3, min(1.5, float(f.bridge_flow_ratio))),
+                min(max_xy_acc, float(f.bridge_accel_mm_s2 or f.default_accel_mm_s2)),
+            )
+        if tag == "GAP_FILL":
+            return (
+                lw_def,
+                min(max_xy_spd, max(5.0, float(f.gap_fill_speed_mm_s))),
+                1.0,
+                min(max_xy_acc, float(f.default_accel_mm_s2)),
+            )
         if tag == "SHELL_IRONING":
             w = max(0.08, float(f.ironing_spacing_mm))
-            spd = max(10.0, 0.45 * float(f.top_solid_infill_speed_mm_s))
+            spd = min(max_xy_spd, max(10.0, 0.45 * float(f.top_solid_infill_speed_mm_s)))
             flow = max(0.02, float(f.ironing_flow_pct) / 100.0)
-            return w, spd, flow, float(f.default_accel_mm_s2)
-        if tag == "SHELL_EXT_PERIM":
+            return w, spd, flow, min(max_xy_acc, float(f.default_accel_mm_s2))
+        if tag in ("SHELL_EXT_PERIM", "OVERHANG_PERIM"):
             return (
                 max(0.15, float(f.external_perimeter_line_width or lw_def)),
-                max(5.0, float(f.external_perimeter_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.external_perimeter_speed_mm_s))),
                 1.0,
-                float(f.external_perimeter_accel_mm_s2 or f.perimeter_accel_mm_s2),
+                min(max_xy_acc, float(f.external_perimeter_accel_mm_s2 or f.perimeter_accel_mm_s2)),
             )
-        if tag in ("SHELL_PERIM", "SHELL_HOLE"):
+        if tag in ("SHELL_PERIM", "SHELL_HOLE", "THIN_WALL"):
             return (
                 max(0.15, float(f.perimeter_line_width or lw_def)),
-                max(5.0, float(f.perimeter_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.perimeter_speed_mm_s))),
                 1.0,
-                float(f.perimeter_accel_mm_s2 or f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.perimeter_accel_mm_s2 or f.default_accel_mm_s2)),
             )
         if tag == "SHELL_TOP_FILL":
             return (
                 max(0.15, float(f.top_infill_line_width or lw_def)),
-                max(5.0, float(f.top_solid_infill_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.top_solid_infill_speed_mm_s))),
                 1.0,
-                float(f.infill_accel_mm_s2 or f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.infill_accel_mm_s2 or f.default_accel_mm_s2)),
             )
         if tag in ("SHELL_FILL", "CELL_CAP_PERIM", "CELL_CAP_HOLE", "CELL_CAP_FILL"):
             return (
                 max(0.15, float(f.solid_infill_line_width or lw_def)),
-                max(5.0, float(f.solid_infill_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.solid_infill_speed_mm_s))),
                 1.0,
-                float(f.infill_accel_mm_s2 or f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.infill_accel_mm_s2 or f.default_accel_mm_s2)),
             )
         if tag == "EXT_SUPPORT_INTERFACE":
             return (
                 max(0.15, float(f.support_line_width or lw_def)),
-                max(5.0, float(f.support_interface_speed_mm_s or f.support_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.support_interface_speed_mm_s or f.support_speed_mm_s))),
                 1.0,
-                float(f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.default_accel_mm_s2)),
             )
         if tag in ("EXT_SUPPORT", "DRY_SUPPORT"):
             return (
                 max(0.15, float(f.support_line_width or lw_def)),
-                max(5.0, float(f.support_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.support_speed_mm_s))),
                 1.0,
-                float(f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.default_accel_mm_s2)),
             )
         if tag == "INSIDE_PERIM":
             return (
                 max(0.15, float(f.infill_line_width or lw_def)),
-                max(5.0, float(f.print_speed_mm_s)),
+                min(max_xy_spd, max(5.0, float(f.print_speed_mm_s))),
                 1.0,
-                float(f.infill_accel_mm_s2 or f.default_accel_mm_s2),
+                min(max_xy_acc, float(f.infill_accel_mm_s2 or f.default_accel_mm_s2)),
             )
-        return lw_def, max(5.0, float(f.print_speed_mm_s)), 1.0, float(f.default_accel_mm_s2)
-
-    def _feature_width_and_speed(self, tag: str, layer_idx: int) -> Tuple[float, float]:
-        w, spd, _, _ = self._feature_params(tag, layer_idx)
-        return w, spd
+        return lw_def, min(max_xy_spd, max(5.0, float(f.print_speed_mm_s))), 1.0, min(max_xy_acc, float(f.default_accel_mm_s2))
 
     def start_gcode(self) -> None:
         """Emit PrusaSlicer 2.9.6 header, heating/homing commands, and initial tool selection."""
         f = self.cfg.fff
         p = self.cfg.printer
-        hyb = self.cfg.hybrid
+        is_fff_only = self.cfg.effective_is_fff_only
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d at %H:%M:%S UTC")
         self.emit(f"; generated by PrusaSlicer 2.9.6 on {ts}")
         self.emit("; AlveoSlicer - Hybrid FFF + In-Situ UV Photopolymer Slicer (Exact Vector Engine)")
-        self.emit(f"; Printer Profile: {p.printer_type} ({p.gcode_flavor})")
+        self.emit(f"; Printer Profile: {p.printer_type} ({p.gcode_flavor}, {p.printer_capability})")
         mode_desc = (
             "Standard FFF Only (Resin & UV Disabled)"
-            if hyb.is_fff_only
-            else f"Hybrid (Pumping={'ON' if hyb.enable_resin_pumping else 'OFF'}, "
-            f"UV={'ON' if hyb.enable_uv_curing else 'OFF'})"
+            if is_fff_only
+            else f"Hybrid (Pumping={'ON' if self.cfg.effective_resin_pumping else 'OFF'}, "
+            f"UV={'ON' if self.cfg.effective_uv_curing else 'OFF'})"
         )
         self.emit(f"; Process Mode: {mode_desc}")
         self.emit(
             f"; Infill: {self.cfg.infill.pattern} | Mode: {self.cfg.infill.mode} | "
+            f"Generator: {self.cfg.infill.slicing_generator} | "
             f"Resin Channel: {self.cfg.infill.min_channel_clearance:.2f} mm | "
             f"Flatten Angle: <{self.cfg.infill.flatten_angle_deg:.1f} deg"
         )
@@ -190,7 +213,23 @@ class GCodeHAL:
         self._active_type = "Custom"
         self.emit("G21 ; set units to millimeters")
         self.emit("G90 ; use absolute coordinates")
-        self.emit("M83 ; use relative distances for extrusion")
+        if p.use_relative_e_distances:
+            self.emit("M83 ; use relative distances for extrusion")
+        else:
+            self.emit("M82 ; use absolute distances for extrusion")
+        if p.gcode_flavor in ("marlin2", "prusa"):
+            self.emit(
+                f"M201 X{int(p.max_accel_x_mm_s2)} Y{int(p.max_accel_y_mm_s2)} "
+                f"Z{int(p.max_accel_z_mm_s2)} E{int(p.max_accel_e_mm_s2)} ; set max accelerations"
+            )
+            self.emit(
+                f"M203 X{int(p.max_feedrate_x_mm_s)} Y{int(p.max_feedrate_y_mm_s)} "
+                f"Z{int(p.max_feedrate_z_mm_s)} E{int(p.max_feedrate_e_mm_s)} ; set max feedrates"
+            )
+            self.emit(
+                f"M205 X{p.max_jerk_x_mm_s:.2f} Y{p.max_jerk_y_mm_s:.2f} "
+                f"Z{p.max_jerk_z_mm_s:.2f} E{p.max_jerk_e_mm_s:.2f} ; set jerk limits"
+            )
         if p.start_gcode and p.start_gcode.strip():
             self._emit_custom_gcode(
                 p.start_gcode,
@@ -207,9 +246,9 @@ class GCodeHAL:
             self.emit(f"M109 S{f.first_layer_nozzle_temp_c} ; wait for extruder temp")
         if f.chamber_temp_c > 0:
             self.emit(f"M141 S{f.chamber_temp_c} ; set chamber temp")
-        if hyb.enable_uv_curing:
+        if self.cfg.effective_uv_curing:
             self.emit(self.cfg.uv.uv_off_gcode + " ; ensure UV LEDs OFF")
-        if not hyb.is_fff_only:
+        if not is_fff_only:
             self.emit(f"{p.tool_fff} ; select FFF extruder")
         self.emit("G92 E0")
 
@@ -236,7 +275,7 @@ class GCodeHAL:
         resin_cm3 = self.total_resin_mm3 / 1000.0
         resin_g = resin_cm3 * 1.15
 
-        is_fff_only = hyb.is_fff_only
+        is_fff_only = self.cfg.effective_is_fff_only
         is_tc = (not is_fff_only) and (p.printer_type == "corexy_toolchanger")
         n_ext = 1 if is_fff_only else (3 if is_tc else 2)
 
@@ -310,15 +349,20 @@ class GCodeHAL:
         )
         self.emit("")
         self.emit("; prusaslicer_config = begin")
+        infill_pat = (
+            self.cfg.infill.standard_fill_pattern
+            if (str(self.cfg.infill.infill_engine).lower() == "standard" or not self.cfg.is_hybrid_printer)
+            else self.cfg.infill.pattern
+        )
         config_pairs = [
             ("avoid_crossing_perimeters", "1" if f.avoid_crossing_perimeters else "0"),
             ("bed_shape", bed_shape_str),
             ("bed_temperature", bed_temps),
-            ("bottom_fill_pattern", "monotonic"),
+            ("bottom_fill_pattern", self.cfg.infill.bottom_fill_pattern),
             ("bottom_solid_layers", str(f.bottom_solid_layers)),
             ("bottom_solid_min_thickness", f"{f.min_bottom_shell_thickness_mm:.2f}"),
             ("bridge_acceleration", str(int(f.bridge_accel_mm_s2))),
-            ("bridge_angle", "0"),
+            ("bridge_angle", f"{self.cfg.infill.bridge_angle_deg:.0f}"),
             ("bridge_fan_speed", bridge_fans),
             ("bridge_flow_ratio", f"{f.bridge_flow_ratio:.2f}"),
             ("bridge_speed", f"{f.bridge_speed_mm_s:.1f}"),
@@ -354,8 +398,8 @@ class GCodeHAL:
             ("filament_max_volumetric_speed", vol_vec),
             ("filament_type", fil_types),
             ("fill_angle", f"{f.infill_angle_deg:.0f}"),
-            ("fill_density", "20%"),
-            ("fill_pattern", self.cfg.infill.pattern),
+            ("fill_density", f"{self.cfg.infill.fill_density_pct:.0f}%"),
+            ("fill_pattern", infill_pat),
             ("first_layer_acceleration", str(int(f.first_layer_accel_mm_s2))),
             ("first_layer_bed_temperature", first_bed_temps),
             ("first_layer_extrusion_width", f"{f.first_layer_line_width:.3f}"),
@@ -372,7 +416,7 @@ class GCodeHAL:
             ("infill_every_layers", str(f.combine_infill_every_n_layers)),
             ("infill_extruder", "1"),
             ("infill_extrusion_width", f"{f.infill_line_width:.3f}"),
-            ("infill_first", "0"),
+            ("infill_first", "1" if self.cfg.infill.infill_before_perimeters else "0"),
             ("infill_overlap", f"{f.infill_overlap_pct:.0f}%"),
             ("infill_speed", f"{f.print_speed_mm_s:.1f}"),
             ("ironing", "1" if f.ironing_enable else "0"),
@@ -415,8 +459,8 @@ class GCodeHAL:
             ("skirts", str(f.skirt_loops)),
             ("slice_closing_radius", "0.049"),
             ("small_perimeter_speed", f"{f.small_perimeter_speed_mm_s:.1f}"),
-            ("solid_infill_below_area", "0"),
-            ("solid_infill_every_layers", "0"),
+            ("solid_infill_below_area", f"{self.cfg.infill.solid_infill_threshold_area_mm2:.1f}"),
+            ("solid_infill_every_layers", str(self.cfg.infill.solid_infill_every_layers)),
             ("solid_infill_extruder", "1"),
             ("solid_infill_extrusion_width", f"{f.solid_infill_line_width:.3f}"),
             ("solid_infill_speed", f"{f.solid_infill_speed_mm_s:.1f}"),
@@ -434,7 +478,7 @@ class GCodeHAL:
             ("support_material_style", f.support_style),
             ("temperature", temps),
             ("thin_walls", "1" if f.detect_thin_walls else "0"),
-            ("top_fill_pattern", "monotonic"),
+            ("top_fill_pattern", self.cfg.infill.top_fill_pattern),
             ("top_infill_extrusion_width", f"{f.top_infill_line_width:.3f}"),
             ("top_solid_infill_speed", f"{f.top_solid_infill_speed_mm_s:.1f}"),
             ("top_solid_layers", str(0 if f.spiral_vase else f.top_solid_layers)),
@@ -459,7 +503,7 @@ class GCodeHAL:
         p = self.cfg.printer
         self.emit("")
         self.emit(";TYPE:Custom")
-        if self.cfg.hybrid.enable_uv_curing:
+        if self.cfg.effective_uv_curing:
             self.emit(self.cfg.uv.uv_off_gcode + " ; UV OFF")
         if p.end_gcode and p.end_gcode.strip():
             self._emit_custom_gcode(p.end_gcode, max_layer_z=f"{self.cur_z:.3f}")
@@ -477,19 +521,28 @@ class GCodeHAL:
         z: float,
         paths: List[Tuple[str, np.ndarray]],
         layer_height: Optional[float] = None,
+        outer_geom: Optional[Any] = None,
     ) -> None:
-        """Emit complete FFF layer G-code (temperatures, fan ramp, retractions, M204, extrusions)."""
+        """Emit complete FFF layer G-code (temps, auto-cooling ramp, bridge fan, retractions, wipe, spiral Z)."""
         f = self.cfg.fff
         p = self.cfg.printer
         h_layer = float(layer_height) if layer_height is not None else (
             f.first_layer_height if layer_idx == 1 else f.layer_height
         )
+        prev_z = self.cur_z
         z_eff = max(0.05, z + float(p.z_offset_mm))
-        f_travel = f.travel_speed_mm_s * 60.0
-        f_travel_z = max(2.0, float(f.z_travel_speed_mm_s)) * 60.0
-        f_ret = f.retract_speed_mm_s * 60.0
-        f_deret = (f.deretract_speed_mm_s if f.deretract_speed_mm_s > 0.1 else f.retract_speed_mm_s) * 60.0
+        max_xy_spd = max(10.0, min(float(p.max_feedrate_x_mm_s), float(p.max_feedrate_y_mm_s)))
+        travel_spd = min(max_xy_spd, max(10.0, float(f.travel_speed_mm_s)))
+        f_travel = travel_spd * 60.0
+        f_travel_z = min(float(p.max_feedrate_z_mm_s), max(2.0, float(f.z_travel_speed_mm_s))) * 60.0
+        f_ret = min(float(p.max_feedrate_e_mm_s), max(1.0, float(f.retract_speed_mm_s))) * 60.0
+        raw_deret = f.deretract_speed_mm_s if f.deretract_speed_mm_s > 0.1 else f.retract_speed_mm_s
+        f_deret = min(float(p.max_feedrate_e_mm_s), max(1.0, float(raw_deret))) * 60.0
         min_ret_travel = max(0.2, float(f.retract_min_travel_mm))
+        rel_e = bool(p.use_relative_e_distances)
+        retract_len = float(f.retract_length_mm)
+        z_hop = float(f.z_hop_mm)
+        use_fw_ret = bool(p.use_firmware_retraction)
 
         self.emit("")
         self.emit(";LAYER_CHANGE")
@@ -498,7 +551,16 @@ class GCodeHAL:
         self.emit(";BEFORE_LAYER_CHANGE")
         if p.before_layer_gcode and p.before_layer_gcode.strip():
             self._emit_custom_gcode(p.before_layer_gcode, layer_num=layer_idx, layer_z=f"{z_eff:.3f}")
+        if f.retract_on_layer_change and layer_idx > 1 and not self._retracted and retract_len > 0.0:
+            if use_fw_ret:
+                self.emit("G10 ; retract on layer change")
+            elif rel_e:
+                self.emit(f"G1 E-{retract_len:.5f} F{f_ret:.0f} ; retract on layer change")
+            else:
+                self.emit(f"G1 E{-retract_len:.5f} F{f_ret:.0f} ; retract on layer change")
+            self._retracted = True
         self.emit("G92 E0")
+        layer_e = 0.0
         self.emit(f";{z_eff:.3f}")
         self.emit(";AFTER_LAYER_CHANGE")
         self.emit(f";{z_eff:.3f}")
@@ -511,77 +573,202 @@ class GCodeHAL:
             if f.bed_temp_c != f.first_layer_bed_temp_c:
                 self.emit(f"M140 S{f.bed_temp_c} ; set running bed temp")
 
-        # Part cooling fan ramp from fan_disable_first_layers to fan_full_speed_at_layer
+        # Estimate raw layer print time for auto-cooling slowdown & fan boost
+        hypot = math.hypot
+        tag_cache: dict[str, Tuple[str, float, float, float, float]] = {}
+        raw_layer_time = 0.0
+        px, py = self.cur_x, self.cur_y
+        for tag, poly in paths:
+            if len(poly) < 2:
+                continue
+            cached = tag_cache.get(tag)
+            if cached is None:
+                prusa_type = PRUSA_TYPE_MAP.get(tag, "Internal infill")
+                feat_w, feat_spd, flow_scale, feat_acc = self._feature_params(tag, layer_idx)
+                max_vol = float(f.max_volumetric_speed_mm3_s)
+                if max_vol > 0.1 and flow_scale > 0.01:
+                    vol_per_mm = feat_w * h_layer * flow_scale
+                    if vol_per_mm > 1e-4:
+                        feat_spd = min(feat_spd, max(5.0, max_vol / vol_per_mm))
+                e_per_mm = self._e_per_mm(feat_w, h_layer, flow_scale=flow_scale)
+                cached = (prusa_type, feat_w, feat_spd, e_per_mm, feat_acc)
+                tag_cache[tag] = cached
+            feat_spd = cached[2]
+            pts_c = poly.tolist()
+            raw_layer_time += hypot(pts_c[0][0] - px, pts_c[0][1] - py) / travel_spd
+            px, py = pts_c[0][0], pts_c[0][1]
+            for pt in pts_c[1:]:
+                raw_layer_time += hypot(pt[0] - px, pt[1] - py) / feat_spd
+                px, py = pt[0], pt[1]
+
+        speed_scale = 1.0
+        min_layer_t = float(f.slowdown_below_layer_time_s)
+        if f.fan_auto_cooling and layer_idx > max(1, int(f.fan_disable_first_layers)) and 0.05 < raw_layer_time < min_layer_t:
+            speed_scale = max(0.15, raw_layer_time / max(min_layer_t, 0.1))
+
+        # Part cooling fan ramp from fan_disable_first_layers to fan_full_speed_at_layer (+ auto-cooling boost)
         fan_start_layer = max(1, int(f.fan_disable_first_layers) + 1)
         fan_full_layer = max(fan_start_layer, int(f.fan_full_speed_at_layer))
-        if f.part_cooling_fan_pct > 0 and fan_start_layer <= layer_idx <= fan_full_layer:
-            if fan_full_layer == fan_start_layer:
-                pct = f.part_cooling_fan_pct
+        base_fan_pwm = 0
+        if f.part_cooling_fan_pct > 0 and layer_idx >= fan_start_layer:
+            if layer_idx >= fan_full_layer or fan_full_layer == fan_start_layer:
+                pct = float(f.part_cooling_fan_pct)
             else:
                 frac = (layer_idx - fan_start_layer) / float(fan_full_layer - fan_start_layer)
                 pct = f.min_fan_speed_pct + frac * (f.part_cooling_fan_pct - f.min_fan_speed_pct)
-            fan_pwm = int(round(255 * max(0.0, min(100.0, pct)) / 100.0))
-            self.emit(f"M106 S{fan_pwm}")
+            if speed_scale < 0.99:
+                pct = max(pct, float(f.part_cooling_fan_pct))
+            base_fan_pwm = int(round(255 * max(0.0, min(100.0, pct)) / 100.0))
+            self._set_fan_pwm(base_fan_pwm)
+        bridge_fan_pwm = int(round(255 * max(0.0, min(100.0, float(f.fan_bridge_pct))) / 100.0))
 
         self.emit(f"G1 Z{z_eff:.3f} F{f_travel_z:.0f} ; move to layer Z")
         self.cur_z = z_eff
         self._active_type = None
         self._active_width = None
 
-        max_vol = float(f.max_volumetric_speed_mm3_s)
+        lift_cmd = f"G1 Z{z_eff + z_hop:.3f} F{f_travel_z:.0f} ; lift Z"
+        restore_cmd = f"G1 Z{z_eff:.3f} F{f_travel_z:.0f} ; restore layer Z"
+        f_travel_str = f"{f_travel:.0f}"
+
+        emit = self.lines.append
+        cur_x = self.cur_x
+        cur_y = self.cur_y
+        total_e = self.total_e_fff_mm
+        est_t = self.est_time_s
+        min_print_spd = max(3.0, float(f.min_print_speed_mm_s))
+        small_perim_spd = max(5.0, float(f.small_perimeter_speed_mm_s))
+        is_spiral = bool(f.spiral_vase) and layer_idx > max(1, int(f.bottom_solid_layers))
+        avoid_cross = bool(f.avoid_crossing_perimeters) and outer_geom is not None and not outer_geom.is_empty
+        interior_anchor = None
+        if avoid_cross:
+            try:
+                from shapely.geometry import LineString as _LS
+                from ...core.geometry import safe_buffer as _sb
+                interior_anchor = _sb(outer_geom, -0.5 * f.line_width, join_style=2)
+                if interior_anchor.is_empty:
+                    interior_anchor = outer_geom
+            except Exception:
+                avoid_cross = False
+
+        def _emit_retract(cur_e: float) -> None:
+            if self._retracted or retract_len <= 0.0:
+                return
+            if use_fw_ret:
+                emit("G10 ; firmware retract")
+            else:
+                e_target = -retract_len if rel_e else (cur_e - retract_len)
+                if f.wipe_on_retract and self._last_printed_seg is not None:
+                    sx, sy, ex, ey = self._last_printed_seg
+                    seg_d = hypot(ex - sx, ey - sy)
+                    if seg_d > 0.5:
+                        wd = min(1.5, seg_d * 0.5)
+                        wx = ex + (sx - ex) * (wd / seg_d)
+                        wy = ey + (sy - ey) * (wd / seg_d)
+                        emit(f"G1 X{wx:.3f} Y{wy:.3f} E{e_target:.5f} F{f_ret:.0f} ; wipe & retract")
+                        self._retracted = True
+                        return
+                emit(f"G1 E{e_target:.5f} F{f_ret:.0f} ; retract")
+            self._retracted = True
+
+        def _emit_unretract(cur_e: float) -> None:
+            if not self._retracted or retract_len <= 0.0:
+                return
+            if use_fw_ret:
+                emit("G11 ; firmware unretract")
+            else:
+                e_target = retract_len if rel_e else cur_e
+                emit(f"G1 E{e_target:.5f} F{f_deret:.0f} ; unretract")
+            self._retracted = False
 
         for tag, poly in paths:
             if len(poly) < 2:
                 continue
+            prusa_type, _fw, base_spd, e_per_mm, feat_acc = tag_cache[tag]
 
-            prusa_type = PRUSA_TYPE_MAP.get(tag, "Internal infill")
-            feat_w, feat_spd, flow_scale, feat_acc = self._feature_params(tag, layer_idx)
-            # Volumetric speed clamp (PrusaSlicer max_volumetric_speed)
-            if max_vol > 0.1 and flow_scale > 0.01:
-                vol_per_mm = feat_w * h_layer * flow_scale
-                if vol_per_mm > 1e-4:
-                    feat_spd = min(feat_spd, max(5.0, max_vol / vol_per_mm))
+            if tag == "BRIDGE" and layer_idx >= fan_start_layer:
+                self._set_fan_pwm(bridge_fan_pwm)
+            else:
+                self._set_fan_pwm(base_fan_pwm)
 
-            f_print = feat_spd * 60.0
-            e_per_mm = self._e_per_mm(feat_w, h_layer, flow_scale=flow_scale)
-            self._set_feature(prusa_type, feat_w)
+            self._set_feature(prusa_type, _fw)
             self._set_accel(feat_acc)
 
-            x0, y0 = float(poly[0, 0]), float(poly[0, 1])
-            dist_travel = math.hypot(x0 - self.cur_x, y0 - self.cur_y)
-            if dist_travel > min_ret_travel:
-                if f.retract_length_mm > 0.0:
-                    if p.use_firmware_retraction:
-                        self.emit("G10 ; firmware retract")
-                    else:
-                        self.emit(f"G1 E-{f.retract_length_mm:.5f} F{f_ret:.0f} ; retract")
-                if f.z_hop_mm > 0.0:
-                    self.emit(f"G1 Z{z_eff + f.z_hop_mm:.3f} F{f_travel_z:.0f} ; lift Z")
-                self.emit(f"G1 X{x0:.3f} Y{y0:.3f} F{f_travel:.0f} ; move to start")
-                if f.z_hop_mm > 0.0:
-                    self.emit(f"G1 Z{z_eff:.3f} F{f_travel_z:.0f} ; restore layer Z")
-                if f.retract_length_mm > 0.0:
-                    if p.use_firmware_retraction:
-                        self.emit("G11 ; firmware unretract")
-                    else:
-                        self.emit(f"G1 E{f.retract_length_mm:.5f} F{f_deret:.0f} ; unretract")
-                self.est_time_s += (dist_travel / f.travel_speed_mm_s) + 0.15
-            else:
-                self.emit(f"G1 X{x0:.3f} Y{y0:.3f} F{f_travel:.0f}")
-                self.est_time_s += dist_travel / f.travel_speed_mm_s
-            self.cur_x, self.cur_y = x0, y0
+            pts = poly.tolist()
+            poly_len = 0.0
+            for k_i in range(len(pts) - 1):
+                poly_len += hypot(pts[k_i + 1][0] - pts[k_i][0], pts[k_i + 1][1] - pts[k_i][1])
 
-            self.emit(f"G1 F{f_print:.0f}")
-            for pt in poly[1:]:
-                nx_, ny_ = float(pt[0]), float(pt[1])
-                seg_len = math.hypot(nx_ - self.cur_x, ny_ - self.cur_y)
+            eff_spd = base_spd
+            if tag in ("SHELL_EXT_PERIM", "SHELL_PERIM", "SHELL_HOLE", "OVERHANG_PERIM") and poly_len <= 25.0 and layer_idx > 1:
+                eff_spd = min(eff_spd, small_perim_spd)
+            if speed_scale < 0.99:
+                eff_spd = max(min_print_spd, eff_spd * speed_scale)
+            f_print_cmd = f"G1 F{eff_spd * 60.0:.0f}"
+
+            x0, y0 = pts[0][0], pts[0][1]
+            dist_travel = hypot(x0 - cur_x, y0 - cur_y)
+
+            detour_pts = [(x0, y0)]
+            if avoid_cross and dist_travel > min_ret_travel and interior_anchor is not None:
+                try:
+                    tline = _LS([(cur_x, cur_y), (x0, y0)])
+                    if outer_geom.distance(tline.interpolate(0.0)) <= 1.2 and outer_geom.distance(tline.interpolate(tline.length)) <= 1.2:
+                        if not outer_geom.covers(tline):
+                            c_pt = interior_anchor.representative_point()
+                            detour_pts = [(float(c_pt.x), float(c_pt.y)), (x0, y0)]
+                except Exception:
+                    detour_pts = [(x0, y0)]
+
+            if dist_travel > min_ret_travel and len(detour_pts) == 1:
+                _emit_retract(layer_e)
+                if z_hop > 0.0:
+                    emit(lift_cmd)
+                emit(f"G1 X{x0:.3f} Y{y0:.3f} F{f_travel_str} ; move to start")
+                if z_hop > 0.0:
+                    emit(restore_cmd)
+                _emit_unretract(layer_e)
+                est_t += (dist_travel / travel_spd) + 0.15
+            else:
+                if self._retracted:
+                    _emit_unretract(layer_e)
+                for wx, wy in detour_pts:
+                    seg_t = hypot(wx - cur_x, wy - cur_y)
+                    emit(f"G1 X{wx:.3f} Y{wy:.3f} F{f_travel_str}")
+                    est_t += seg_t / travel_spd
+                    cur_x, cur_y = wx, wy
+            cur_x, cur_y = x0, y0
+
+            emit(f_print_cmd)
+            inv_spd = 1.0 / eff_spd
+            use_spiral_z = is_spiral and tag == "SHELL_EXT_PERIM" and poly_len > 1e-3
+            s_acc = 0.0
+            for pt in pts[1:]:
+                nx_, ny_ = pt[0], pt[1]
+                seg_len = hypot(nx_ - cur_x, ny_ - cur_y)
                 if seg_len < 1e-4:
                     continue
                 e_val = seg_len * e_per_mm
-                self.emit(f"G1 X{nx_:.3f} Y{ny_:.3f} E{e_val:.5f}")
-                self.total_e_fff_mm += e_val
-                self.est_time_s += seg_len / feat_spd
-                self.cur_x, self.cur_y = nx_, ny_
+                layer_e += e_val
+                e_out = e_val if rel_e else layer_e
+                if use_spiral_z:
+                    s_acc += seg_len
+                    z_seg = prev_z + (z_eff - prev_z) * min(1.0, s_acc / poly_len)
+                    emit(f"G1 X{nx_:.3f} Y{ny_:.3f} Z{z_seg:.3f} E{e_out:.5f}")
+                else:
+                    emit(f"G1 X{nx_:.3f} Y{ny_:.3f} E{e_out:.5f}")
+                self._last_printed_seg = (cur_x, cur_y, nx_, ny_)
+                total_e += e_val
+                est_t += seg_len * inv_spd
+                cur_x, cur_y = nx_, ny_
+
+        if layer_idx >= fan_start_layer and self._active_fan_pwm != base_fan_pwm:
+            self._set_fan_pwm(base_fan_pwm)
+
+        self.cur_x = cur_x
+        self.cur_y = cur_y
+        self.total_e_fff_mm = total_e
+        self.est_time_s = est_t
 
     def compute_uv_speed_and_passes(self, slab_thickness_mm: float) -> Tuple[float, int]:
         """Compute Beer-Lambert UV scan speed (mm/s) and pass count for ``slab_thickness_mm``."""

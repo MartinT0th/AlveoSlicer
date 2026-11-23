@@ -10,6 +10,7 @@ import numpy as np
 from alveoslicer import (
     BedslingerPrototypeHAL,
     CoreXYToolchangerHAL,
+    PresetManager,
     SlicerConfig,
     create_hal,
     create_test_curved_wall_mesh,
@@ -20,7 +21,7 @@ from alveoslicer import (
 from alveoslicer.hybrid.dosing import plan_cycle_dosing
 from alveoslicer.hybrid.scheduler import CureCycle, compute_optimal_cure_schedule
 from alveoslicer.slicing.layer import SlicedLayer
-from tests.test_infill_slicing import assert_prusaslicer_296_contract
+from tests.test_infill_slicing import assert_prusaslicer_296_contract, make_watertight_xz_prism
 
 
 class TestHybridPipelineAndGCode(unittest.TestCase):
@@ -254,6 +255,98 @@ class TestHybridPipelineAndGCode(unittest.TestCase):
             f"DP should rebalance earlier pump layers to avoid hard_roof_closure, got schedule={schedule}",
         )
         self.assertIn(7, [c.end_layer for c in schedule])
+
+    def test_complete_fff_settings_spiral_vase_and_machine_limits(self) -> None:
+        """Verify bridge flow/fan/accel, gap fill, thin walls, auto-cooling, M82, machine limits & spiral vase."""
+        import trimesh
+
+        bridge_arch = make_watertight_xz_prism(
+            x_edges=[98.0, 103.0, 109.0, 114.0],
+            z_edges=[0.0, 4.0, 6.0],
+            filled_cells={(0, 0), (2, 0), (0, 1), (1, 1), (2, 1)},
+        )
+
+        cfg = SlicerConfig()
+        cfg.printer.printer_capability = "fff_only"
+        cfg.printer.use_relative_e_distances = False
+        cfg.printer.max_feedrate_x_mm_s = 120.0
+        cfg.printer.max_accel_x_mm_s2 = 3000.0
+        cfg.printer.max_jerk_x_mm_s = 9.0
+        cfg.fff.layer_height = 0.50
+        cfg.fff.first_layer_height = 0.50
+        cfg.fff.bridge_flow_ratio = 0.85
+        cfg.fff.bridge_speed_mm_s = 22.0
+        cfg.fff.fan_bridge_pct = 100
+        cfg.fff.bridge_accel_mm_s2 = 650.0
+        cfg.fff.detect_thin_walls = True
+        cfg.fff.gap_fill_enabled = True
+        cfg.fff.small_perimeter_speed_mm_s = 18.0
+        cfg.fff.fan_auto_cooling = True
+        cfg.fff.slowdown_below_layer_time_s = 20.0
+        cfg.fff.min_print_speed_mm_s = 12.0
+        cfg.fff.wipe_on_retract = True
+        cfg.fff.retract_on_layer_change = True
+
+        res = slice_mesh(bridge_arch, cfg)
+        lines = res.gcode_text.splitlines()
+        self.assertIn("M82 ; use absolute distances for extrusion", lines)
+        self.assertTrue(any(ln.startswith("M201 ") for ln in lines))
+        self.assertTrue(any(ln.startswith("M203 ") for ln in lines))
+        self.assertTrue(any(ln.startswith("M205 ") for ln in lines))
+        self.assertTrue(any(ly.bridge_geom is not None and not ly.bridge_geom.is_empty for ly in res.layers))
+        self.assertIn("M204 S650", lines)
+        self.assertIn("M106 S255", lines)
+        self.assertTrue(any("F720" in ln for ln in lines), "Expected auto-cooling slowdown down to min_print_speed_mm_s=12 (F720)")
+        self.assertTrue(any(";TYPE:Gap fill" in ln or ";TYPE:Internal infill" in ln for ln in lines))
+
+        # Test helical Z ramp and zero top layers in spiral_vase mode
+        cyl = trimesh.creation.cylinder(radius=10.0, height=5.0, sections=24)
+        cyl.apply_translation([110.0, 110.0, 2.5])
+        vcfg = SlicerConfig()
+        vcfg.printer.printer_capability = "fff_only"
+        vcfg.fff.layer_height = 0.50
+        vcfg.fff.first_layer_height = 0.50
+        vcfg.fff.spiral_vase = True
+        vcfg.fff.bottom_solid_layers = 2
+        vres = slice_mesh(cyl, vcfg)
+        self.assertNotIn(";TYPE:Top solid infill", vres.gcode_text)
+        vase_zs = [
+            float(tok[1:])
+            for ln in vres.gcode_text.splitlines()
+            if ln.startswith("G1 ") and " Z" in ln and " E" in ln
+            for tok in ln.split()
+            if tok.startswith("Z")
+        ]
+        self.assertGreater(len(set(vase_zs)), 20, "Spiral vase must emit smoothly ramping Z coordinates")
+
+    def test_fff_only_printer_preset_disables_hybrid_pipeline(self) -> None:
+        """Selecting Prusa MK4S or Bambu Lab X1C forces Standard FFF cleanly without resin/UV."""
+        pm = PresetManager()
+        cfg = SlicerConfig()
+        # Deliberately leave hybrid switches ON in cfg and apply an FFF-only printer
+        cfg.hybrid.enable_resin_pumping = True
+        cfg.hybrid.enable_uv_curing = True
+        cfg.infill.infill_engine = "surface_normal_3d"
+
+        self.assertTrue(pm.apply_preset(cfg, "printer", "Prusa MK4S (250x210x220)"))
+        self.assertFalse(cfg.is_hybrid_printer)
+        self.assertTrue(cfg.effective_is_fff_only)
+
+        wall = create_test_curved_wall_mesh(cfg)
+        res = slice_mesh(wall, cfg)
+        self.assertEqual(len(res.schedule), 0)
+        self.assertEqual(res.total_resin_ml, 0.0)
+        self.assertNotIn(cfg.printer.tool_resin, res.gcode_text)
+        self.assertNotIn(cfg.printer.tool_uv, res.gcode_text)
+        assert_prusaslicer_296_contract(self, res.gcode_text)
+
+        self.assertTrue(pm.apply_preset(cfg, "printer", "Bambu Lab X1C (256x256x256)"))
+        self.assertFalse(cfg.is_hybrid_printer)
+        self.assertEqual(cfg.printer.gcode_flavor, "klipper")
+        self.assertEqual(cfg.printer.bed_size_x, 256.0)
+        res_bambu = slice_mesh(wall, cfg)
+        self.assertEqual(len(res_bambu.schedule), 0)
+        self.assertEqual(res_bambu.total_resin_ml, 0.0)
 
 
 if __name__ == "__main__":

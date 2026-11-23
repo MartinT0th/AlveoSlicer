@@ -9,6 +9,7 @@ import trimesh
 from PySide6.QtCore import QThread, Signal
 
 from ..core.config import SlicerConfig
+from ..gcode.parser import parse_gcode
 from ..pipeline import slice_mesh
 
 
@@ -42,6 +43,8 @@ class SliceWorker(QThread):
                 on_log=self.log_msg.emit,
                 bodies=self.bodies,
             )
+            # Pre-parse G-code on the worker thread so the GUI thread doesn't stall on completion
+            result._preview_data = parse_gcode(result.gcode_text)  # type: ignore[attr-defined]
             self.finished_ok.emit(result)
         except Exception:
             self.failed.emit(traceback.format_exc())

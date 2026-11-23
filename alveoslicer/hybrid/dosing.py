@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-from collections import deque
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -74,15 +73,87 @@ def order_points_tsp(points: List[DosingPoint]) -> List[DosingPoint]:
     return [points[i] for i in route]
 
 
-def _basin_volume_mm3(basin_mask: np.ndarray, px_area: float, h: float, top_h_eff: float, shrinkage: float) -> float:
-    nz = basin_mask.shape[0]
-    vol = 0.0
-    for z_i in range(nz):
-        h_eff = top_h_eff if z_i == nz - 1 else h
-        cnt = int(np.count_nonzero(basin_mask[z_i]))
-        if cnt > 0:
-            vol += cnt * px_area * h_eff
-    return vol * shrinkage
+def _basin_volume_mm3(
+    basin_mask: np.ndarray,
+    z_start: int,
+    total_nz: int,
+    px_area: float,
+    h: float,
+    top_h_eff: float,
+    shrinkage: float,
+) -> float:
+    """Compute shrinkage- and headspace-compensated volume for a cropped 3D basin mask."""
+    z_counts = np.count_nonzero(basin_mask, axis=(1, 2))
+    snz = basin_mask.shape[0]
+    h_vec = np.full(snz, h, dtype=np.float64)
+    if z_start + snz == total_nz:
+        h_vec[-1] = top_h_eff
+    return float(np.dot(z_counts, h_vec) * px_area * shrinkage)
+
+
+def _vectorized_multiseed_bfs_volumes(
+    sub_mask: np.ndarray,
+    z_start: int,
+    x_start: int,
+    y_start: int,
+    total_nz: int,
+    seeds_for_bfs: List[Tuple[int, int, int, int]],
+    px_area: float,
+    h: float,
+    top_h_eff: float,
+    shrinkage: float,
+) -> np.ndarray:
+    """Vectorized 10-connected 3D geodesic BFS volume attribution on a tight padded basin sub-box."""
+    snz, snx, sny = sub_mask.shape
+    pz, px_s, py_s = snz + 2, snx + 2, sny + 2
+    padded_mask = np.zeros((pz, px_s, py_s), dtype=bool)
+    padded_mask[1:-1, 1:-1, 1:-1] = sub_mask
+    flat_mask = padded_mask.ravel()
+
+    flat_owner = np.full(flat_mask.size, -1, dtype=np.int32)
+    stride_z = px_s * py_s
+    stride_x = py_s
+    d_offs = np.array(
+        [dz * stride_z + dx * stride_x + dy for dz, dx, dy in _NEIGHBORS_3D],
+        dtype=np.int32,
+    )
+
+    f_idx_list = []
+    f_sid_list = []
+    for sz, sx, sy, sid in seeds_for_bfs:
+        fidx = (sz - z_start + 1) * stride_z + (sx - x_start + 1) * stride_x + (sy - y_start + 1)
+        if flat_owner[fidx] == -1:
+            flat_owner[fidx] = sid
+            f_idx_list.append(fidx)
+            f_sid_list.append(sid)
+
+    frontier = np.asarray(f_idx_list, dtype=np.int32)
+    f_sids = np.asarray(f_sid_list, dtype=np.int32)
+    n_nbrs = len(d_offs)
+
+    while frontier.size > 0:
+        nbrs = (frontier[:, None] + d_offs[None, :]).ravel()
+        ok = flat_mask[nbrs] & (flat_owner[nbrs] == -1)
+        if not np.any(ok):
+            break
+        cand_idx = nbrs[ok]
+        cand_sid = np.repeat(f_sids, n_nbrs)[ok]
+        uniq_idx, first_pos = np.unique(cand_idx, return_index=True)
+        uniq_sid = cand_sid[first_pos]
+        flat_owner[uniq_idx] = uniq_sid
+        frontier = uniq_idx
+        f_sids = uniq_sid
+
+    owner_3d = flat_owner.reshape((pz, px_s, py_s))[1:-1, 1:-1, 1:-1]
+    n_seeds = len(seeds_for_bfs)
+    vols = np.zeros(n_seeds, dtype=np.float64)
+    for z_local in range(snz):
+        h_eff = top_h_eff if (z_start + z_local == total_nz - 1) else h
+        slice_own = owner_3d[z_local]
+        valid_own = slice_own[slice_own >= 0]
+        if valid_own.size > 0:
+            vols += np.bincount(valid_own, minlength=n_seeds) * (px_area * h_eff)
+    return vols * shrinkage
 
 
 def plan_cycle_dosing(
@@ -120,114 +191,108 @@ def plan_cycle_dosing(
     flow_rad_px = rcfg.max_flow_radius_mm / rp
 
     any_xy = np.any(slab, axis=0)
-    xy_idx = np.argwhere(any_xy)
-    if len(xy_idx) == 0:
+    if not np.any(any_xy):
         return [], (0.0, 0.0, 0.0, 0.0)
+    any_x = np.flatnonzero(np.any(any_xy, axis=1))
+    any_y = np.flatnonzero(np.any(any_xy, axis=0))
     bbox_xy = (
-        float(xs[xy_idx[:, 0].min()]),
-        float(ys[xy_idx[:, 1].min()]),
-        float(xs[xy_idx[:, 0].max()]),
-        float(ys[xy_idx[:, 1].max()]),
+        float(xs[any_x[0]]),
+        float(ys[any_y[0]]),
+        float(xs[any_x[-1]]),
+        float(ys[any_y[-1]]),
     )
 
     real_entries: List[Tuple[DosingPoint, int]] = []  # (DosingPoint, basin_id)
-    ghost_basins: List[Tuple[np.ndarray, float, Tuple[float, float]]] = []  # (mask_3d, vol_mm3, centroid_xy)
+    ghost_basins: List[Tuple[Tuple[slice, slice, slice], np.ndarray, float, Tuple[float, float]]] = []
+    basin_slices = ndimage.find_objects(lbl_3d)
 
     for bid in range(1, n_basins + 1):
-        basin_mask = lbl_3d == bid
-        top_open = basin_mask[-1]
-        b_vol = _basin_volume_mm3(basin_mask, px_area, h, top_h_eff, rcfg.shrinkage_factor)
+        sl = basin_slices[bid - 1]
+        if sl is None:
+            continue
+        sl_z, sl_x, sl_y = sl
+        z0, x0, y0 = sl_z.start, sl_x.start, sl_y.start
+        sub_mask = lbl_3d[sl] == bid
+        b_vol = _basin_volume_mm3(sub_mask, z0, nz, px_area, h, top_h_eff, rcfg.shrinkage_factor)
         if b_vol <= 1e-5:
             continue
 
-        top_px = int(np.count_nonzero(top_open))
+        reaches_top = sl_z.stop == nz
+        top_open_sub = sub_mask[-1] if reaches_top else None
+        top_acc_sub = top_acc_global[sl_x, sl_y]
+        top_px = int(np.count_nonzero(top_open_sub)) if top_open_sub is not None else 0
+
         # Ghost basin check: no real top opening, sub-ghost-threshold top pixels, or tiny unaccessible sliver
-        if top_px == 0 or (top_px <= ghost_min_px and not np.any(top_open & top_acc_global)):
-            pts_3d = np.argwhere(basin_mask)
-            cx = float(xs[int(round(float(pts_3d[:, 1].mean())))])
-            cy = float(ys[int(round(float(pts_3d[:, 2].mean())))])
-            ghost_basins.append((basin_mask, b_vol, (cx, cy)))
+        if top_px == 0 or (top_px <= ghost_min_px and not np.any(top_open_sub & top_acc_sub)):
+            pts_3d = np.argwhere(sub_mask)
+            cx = float(xs[x0 + int(round(float(pts_3d[:, 1].mean())))])
+            cy = float(ys[y0 + int(round(float(pts_3d[:, 2].mean())))])
+            ghost_basins.append((sl, sub_mask, b_vol, (cx, cy)))
             continue
 
-        # 8-connected 2D island labeling on top opening prevents diagonal single-pixel ghost islands
-        isl_lbl, n_isl = ndimage.label(top_open, structure=_CONN_2D_8)
-        isl_counts = [int(np.count_nonzero(isl_lbl == iid)) for iid in range(1, n_isl + 1)]
-        has_real_island = any(
-            (cnt > ghost_min_px) or np.any((isl_lbl == (idx + 1)) & top_acc_global)
-            for idx, cnt in enumerate(isl_counts)
-        )
+        assert top_open_sub is not None
+        # 8-connected 2D island labeling on cropped top opening prevents diagonal single-pixel ghost islands
+        isl_lbl, n_isl = ndimage.label(top_open_sub, structure=_CONN_2D_8)
+        isl_counts = np.bincount(isl_lbl.ravel(), minlength=n_isl + 1)
+        isl_acc_counts = np.bincount(isl_lbl[top_acc_sub], minlength=n_isl + 1)
+        has_real_island = bool(np.any((isl_counts[1:] > ghost_min_px) | (isl_acc_counts[1:] > 0)))
+        isl_slices = ndimage.find_objects(isl_lbl)
 
         seeds_for_bfs: List[Tuple[int, int, int, int]] = []
         seed_coords_mm: List[Tuple[float, float]] = []
 
         for iid in range(1, n_isl + 1):
-            isl_mask = isl_lbl == iid
-            cnt = isl_counts[iid - 1]
-            valid_entry = isl_mask & top_acc_global
+            cnt = int(isl_counts[iid])
+            has_acc = int(isl_acc_counts[iid]) > 0
             # Skip sub-threshold ghost top islands when the same 3D basin already has a real entry
-            if has_real_island and cnt <= ghost_min_px and not np.any(valid_entry):
+            if has_real_island and cnt <= ghost_min_px and not has_acc:
                 continue
-            if not np.any(valid_entry):
-                valid_entry = isl_mask
+            isl_sl = isl_slices[iid - 1]
+            if isl_sl is None:
+                continue
+            ix_off, iy_off = isl_sl[0].start, isl_sl[1].start
+            isl_box = isl_lbl[isl_sl] == iid
+            valid_entry = (isl_box & top_acc_sub[isl_sl]) if has_acc else isl_box
 
-            edt = ndimage.distance_transform_edt(isl_mask) * valid_entry
-            if np.max(edt) <= 0.0:
+            # Pad by 1 pixel so EDT measures true distance to island boundary even on sub-box edges
+            padded_isl = np.pad(isl_box, 1, mode="constant", constant_values=False)
+            edt = ndimage.distance_transform_edt(padded_isl)[1:-1, 1:-1] * valid_entry
+            if float(np.max(edt)) <= 0.0:
                 continue
 
+            bnx, bny = isl_box.shape
             remaining = valid_entry.copy()
             while np.any(remaining):
                 masked_edt = edt * remaining
                 flat_best = int(np.argmax(masked_edt))
-                bx, by = divmod(flat_best, ny)
+                lbx, lby = divmod(flat_best, bny)
+                gbx = x0 + ix_off + lbx
+                gby = y0 + iy_off + lby
                 sid = len(seed_coords_mm)
-                seed_coords_mm.append((float(xs[bx]), float(ys[by])))
-                seeds_for_bfs.append((nz - 1, bx, by, sid))
+                seed_coords_mm.append((float(xs[gbx]), float(ys[gby])))
+                seeds_for_bfs.append((nz - 1, gbx, gby, sid))
 
-                ix_lo = max(0, int(bx - flow_rad_px))
-                ix_hi = min(nx, int(bx + flow_rad_px + 1))
-                iy_lo = max(0, int(by - flow_rad_px))
-                iy_hi = min(ny, int(by + flow_rad_px + 1))
+                ix_lo = max(0, int(lbx - flow_rad_px))
+                ix_hi = min(bnx, int(lbx + flow_rad_px + 1))
+                iy_lo = max(0, int(lby - flow_rad_px))
+                iy_hi = min(bny, int(lby + flow_rad_px + 1))
                 sub_x, sub_y = np.ogrid[ix_lo:ix_hi, iy_lo:iy_hi]
-                covered = (sub_x - bx) ** 2 + (sub_y - by) ** 2 <= flow_rad_px**2
+                covered = (sub_x - lbx) ** 2 + (sub_y - lby) ** 2 <= flow_rad_px**2
                 remaining[ix_lo:ix_hi, iy_lo:iy_hi] &= ~covered
 
         if not seeds_for_bfs:
-            pts_3d = np.argwhere(basin_mask)
-            cx = float(xs[int(round(float(pts_3d[:, 1].mean())))])
-            cy = float(ys[int(round(float(pts_3d[:, 2].mean())))])
-            ghost_basins.append((basin_mask, b_vol, (cx, cy)))
+            pts_3d = np.argwhere(sub_mask)
+            cx = float(xs[x0 + int(round(float(pts_3d[:, 1].mean())))])
+            cy = float(ys[y0 + int(round(float(pts_3d[:, 2].mean())))])
+            ghost_basins.append((sl, sub_mask, b_vol, (cx, cy)))
             continue
 
-        owner = np.full((nz, nx, ny), -1, dtype=np.int32)
-        queue: deque[Tuple[int, int, int, int]] = deque()
-        for sz, sx, sy, sid in seeds_for_bfs:
-            owner[sz, sx, sy] = sid
-            queue.append((sz, sx, sy, sid))
-
-        while queue:
-            cz, cx, cy, sid = queue.popleft()
-            for dz, dx, dy in _NEIGHBORS_3D:
-                nz_, nx_, ny_ = cz + dz, cx + dx, cy + dy
-                if (
-                    0 <= nz_ < nz
-                    and 0 <= nx_ < nx
-                    and 0 <= ny_ < ny
-                    and basin_mask[nz_, nx_, ny_]
-                    and owner[nz_, nx_, ny_] == -1
-                ):
-                    owner[nz_, nx_, ny_] = sid
-                    queue.append((nz_, nx_, ny_, sid))
-
-        vols = np.zeros(len(seed_coords_mm), dtype=np.float64)
-        for z_i in range(nz):
-            h_eff = top_h_eff if z_i == nz - 1 else h
-            slice_own = owner[z_i]
-            valid_own = slice_own[slice_own >= 0]
-            if len(valid_own) > 0:
-                counts = np.bincount(valid_own, minlength=len(seed_coords_mm))
-                vols += counts * (px_area * h_eff)
-
-        vols *= rcfg.shrinkage_factor
+        if len(seeds_for_bfs) == 1:
+            vols = np.array([b_vol], dtype=np.float64)
+        else:
+            vols = _vectorized_multiseed_bfs_volumes(
+                sub_mask, z0, x0, y0, nz, seeds_for_bfs, px_area, h, top_h_eff, rcfg.shrinkage_factor
+            )
 
         # Fold any ultra-tiny sub-threshold seed volume into the nearest real seed in this basin
         basin_real_pts: List[DosingPoint] = []
@@ -257,20 +322,30 @@ def plan_cycle_dosing(
                 real_entries.append((pt, bid))
         else:
             # Whole basin had tiny volume — defer to ghost merging
-            pts_3d = np.argwhere(basin_mask)
-            cx = float(xs[int(round(float(pts_3d[:, 1].mean())))])
-            cy = float(ys[int(round(float(pts_3d[:, 2].mean())))])
-            ghost_basins.append((basin_mask, b_vol, (cx, cy)))
+            pts_3d = np.argwhere(sub_mask)
+            cx = float(xs[x0 + int(round(float(pts_3d[:, 1].mean())))])
+            cy = float(ys[y0 + int(round(float(pts_3d[:, 2].mean())))])
+            ghost_basins.append((sl, sub_mask, b_vol, (cx, cy)))
 
     # Merge every ghost island/basin volume into its touching (dilated) real basin, or nearest real island
     if real_entries and ghost_basins:
         real_bids = {bid for _, bid in real_entries}
-        for g_mask, g_vol, (gx, gy) in ghost_basins:
+        for (sl_z, sl_x, sl_y), g_sub, g_vol, (gx, gy) in ghost_basins:
             if g_vol <= 1e-5:
                 continue
-            # Prefer a real basin that touches the ghost island (1-2 px dilation)
-            dil = ndimage.binary_dilation(g_mask, structure=_CONN_3D_26, iterations=2)
-            touch_labels = set(int(v) for v in np.unique(lbl_3d[dil]) if int(v) in real_bids)
+            # Prefer a real basin that touches the ghost island (1-2 px dilation on cropped sub-box)
+            ez0, ez1 = max(0, sl_z.start - 2), min(nz, sl_z.stop + 2)
+            ex0, ex1 = max(0, sl_x.start - 2), min(nx, sl_x.stop + 2)
+            ey0, ey1 = max(0, sl_y.start - 2), min(ny, sl_y.stop + 2)
+            local_g = np.zeros((ez1 - ez0, ex1 - ex0, ey1 - ey0), dtype=bool)
+            local_g[
+                sl_z.start - ez0 : sl_z.stop - ez0,
+                sl_x.start - ex0 : sl_x.stop - ex0,
+                sl_y.start - ey0 : sl_y.stop - ey0,
+            ] = g_sub
+            dil = ndimage.binary_dilation(local_g, structure=_CONN_3D_26, iterations=2)
+            local_lbl = lbl_3d[ez0:ez1, ex0:ex1, ey0:ey1]
+            touch_labels = {int(v) for v in np.unique(local_lbl[dil]) if int(v) in real_bids}
             if touch_labels:
                 candidates = [pt for pt, bid in real_entries if bid in touch_labels]
             else:

@@ -293,6 +293,64 @@ class TestUISmoke(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SIDEBAR_DENSITY_UNITS_OK", proc.stdout)
 
+    def test_fff_only_printer_capability_ui_and_generators(self) -> None:
+        env = os.environ.copy()
+        env["QT_QPA_PLATFORM"] = "offscreen"
+        code = (
+            "import tempfile\n"
+            "from pathlib import Path\n"
+            "from PySide6.QtWidgets import QApplication\n"
+            "from alveoslicer import PresetManager\n"
+            "from alveoslicer.ui import AlveoSlicerWindow\n"
+            "app = QApplication([])\n"
+            "with tempfile.TemporaryDirectory() as tmp:\n"
+            "    pm = PresetManager(user_dir=Path(tmp))\n"
+            "    win = AlveoSlicerWindow(preset_manager=pm)\n"
+            "    win.resize(1380, 860)\n"
+            "    win.show()\n"
+            "    app.processEvents()\n"
+            "    resin_idx = win._category_tab_indices['resin']\n"
+            "    assert win.tabs.count() == 6\n"
+            "    assert win.tabs.isTabVisible(resin_idx)\n"
+            "    gen_b = win.settings_tabs['print']._bindings['infill.slicing_generator']\n"
+            "    assert gen_b.getter() == 'mesh_direct'\n"
+            "    gen_b.setter('analytic_hex')\n"
+            "    assert win.cfg.infill.slicing_generator == 'analytic_hex'\n"
+            "    win._on_preset_selected('printer', 'Prusa MK4S (250x210x220)')\n"
+            "    app.processEvents()\n"
+            "    assert win.tabs.count() == 6\n"
+            "    assert not win.cfg.is_hybrid_printer\n"
+            "    assert not win.tabs.isTabVisible(resin_idx)\n"
+            "    assert 'STANDARD FFF' in win.plater.lbl_mode_badge.text()\n"
+            "    assert not win.plater._tile_uv_cycles.isVisible()\n"
+            "    assert not win.plater._resin_material_row.isVisible()\n"
+            "    assert not win.plater.cure_cadence_strip.isVisible()\n"
+            "    assert not win.plater.btn_mode_basins.isVisible()\n"
+            "    assert not win.plater.chk_wireframe.isVisible()\n"
+            "    assert all(not w.isVisible() for w in win.plater._preset_row_widgets['resin'])\n"
+            "    ptab = win.settings_tabs['print']\n"
+            "    sec_hidden = {it.text(): it.isHidden() for it, _, _ in ptab._section_meta}\n"
+            "    assert sec_hidden['Hybrid Mode'] and sec_hidden['Resin Pump & Needle'] and sec_hidden['UV Hardening']\n"
+            "    pr_items = [win.plater._preset_combos['print'].itemData(i) for i in range(win.plater._preset_combos['print'].count())]\n"
+            "    assert '0.20mm QUALITY (Hexagonal Hybrid)' not in pr_items\n"
+            "    assert any('Prusa MK4S' in x for x in pr_items)\n"
+            "    win._on_preset_selected('printer', 'Bambu Lab X1C (256x256x256)')\n"
+            "    app.processEvents()\n"
+            "    assert abs(win.cfg.printer.bed_size_x - 256.0) < 1e-6\n"
+            "    assert not win.tabs.isTabVisible(resin_idx)\n"
+            "    win._on_preset_selected('printer', 'Alveo Prototype 1 (Bedslinger 220)')\n"
+            "    app.processEvents()\n"
+            "    assert win.cfg.is_hybrid_printer\n"
+            "    assert win.tabs.isTabVisible(resin_idx)\n"
+            "    assert win.plater._tile_uv_cycles.isVisible()\n"
+            "    assert win.plater._resin_material_row.isVisible()\n"
+            "    win.close()\n"
+            "print('FFF_MODE_AND_GENERATORS_UI_OK')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("FFF_MODE_AND_GENERATORS_UI_OK", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

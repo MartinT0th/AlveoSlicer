@@ -23,8 +23,8 @@ def clear_icon_cache() -> None:
 
 def make_icon(
     name: str,
-    color: str = "#eceff4",
-    accent: str = "#f5c518",
+    color: str = "#cfd9e6",
+    accent: str = "#f5b82e",
     size: int = 20,
 ) -> QIcon:
     """Render and cache a 2x high-DPI ``QIcon`` for ``name`` using ``color`` and ``accent``."""

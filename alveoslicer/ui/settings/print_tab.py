@@ -10,6 +10,7 @@ from ...core.config import (
     FUZZY_SKIN_MODES,
     INFILL_ENGINES,
     SEAM_POSITIONS,
+    SLICING_GENERATORS,
     STANDARD_INFILL_PATTERNS,
     SUPPORT_MODES,
     SUPPORT_PATTERNS,
@@ -89,6 +90,7 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         sp_fz_th.setEnabled(fz_on)
         sp_fz_pd.setEnabled(fz_on)
 
+    tab.mark_advanced(g_fuzzy, g_comp)
     tab.add_post_change_hook(_sync_layers_finish)
     tab.add_section("Layers and perimeters", make_page_container([g_layer, g_vert, g_horiz, g_fuzzy, g_comp]), "layers")
 
@@ -101,9 +103,27 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
             "standard: PrusaSlicer-style density-driven infill (Rectilinear, Grid, Gyroid, Honeycomb, Cubic, Lightning, etc.)"
         ),
     )
+    _gen_labels = {
+        "mesh_direct": "Mesh Direct (Fast, Zero Voxels)",
+        "analytic_hex": "Analytic Hex / Slices (Faster 3D)",
+        "planar_25d": "Planar 2.5D Ribs (Fastest)",
+        "voxel_sdf": "Voxel SDF (Legacy Reference)",
+    }
+    cb_gen = tab.bind_combo_mapped(
+        "infill.slicing_generator",
+        [(g, _gen_labels.get(g, g)) for g in SLICING_GENERATORS],
+        i.slicing_generator,
+        tooltip=(
+            "mesh_direct: direct triangle surface seeding (no voxels, fast) | "
+            "analytic_hex: analytic XY slice contour seeding (no voxels) | "
+            "planar_25d: ultra-fast 2.5D ribs & channels | "
+            "voxel_sdf: legacy 3D voxel distance field"
+        ),
+    )
     lbl_eng_info = QLabel()
     lbl_eng_info.setWordWrap(True)
     feng.addRow("Infill architecture:", cb_engine)
+    feng.addRow("Cellular generator:", cb_gen)
     feng.addRow(lbl_eng_info)
 
     g_std, fstd = make_card("Standard PrusaSlicer Infill")
@@ -180,11 +200,18 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     fia.addRow("Combine infill every:", tab.bind_spin("fff.combine_infill_every_n_layers", f.combine_infill_every_n_layers, 1, 5, 1, "layers"))
     fia.addRow(tab.bind_checkbox("infill.infill_before_perimeters", "Infill before perimeters (print infill before outer shells)", i.infill_before_perimeters))
 
+    sp_vox_ref: List[object] = []
+
     def _sync_mode() -> None:
-        is_std = cb_engine.currentText() == "standard"
+        is_hyb = tab.hybrid_enabled
+        is_std = (not is_hyb) or (cb_engine.currentText() == "standard")
         g_std.setEnabled(is_std)
         g_pat.setEnabled(not is_std)
         g_geo.setEnabled(not is_std)
+        cb_gen.setEnabled(not is_std)
+        if sp_vox_ref:
+            gen_val = str(cb_gen.currentData() or cb_gen.currentText())
+            sp_vox_ref[0].setEnabled((not is_std) and (gen_val == "voxel_sdf"))
         if is_std:
             lbl_eng_info.setObjectName("modeBannerFFF")
             lbl_eng_info.setText(
@@ -206,6 +233,8 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         chk_nd.setEnabled((not is_std) and (not is_hollow))
         sp_nd.setEnabled((not is_std) and (not is_hollow) and chk_nd.isChecked())
 
+    tab.mark_advanced(g_inf_adv)
+    tab.mark_hybrid_only(g_eng, g_pat, g_geo)
     tab.add_post_change_hook(_sync_mode)
     tab.add_section("Infill", make_page_container([g_eng, g_std, g_pat, g_geo, g_inf_adv]), "infill")
 
@@ -298,6 +327,8 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     note_sup.setObjectName("mutedLabel")
     note_sup.setWordWrap(True)
     fdry.addRow(note_sup)
+    tab.mark_advanced(g_dry)
+    tab.mark_hybrid_only(g_dry)
     tab.add_section("Support material", make_page_container([g_sup, g_org, g_dry]), "support")
 
     # ---- 5. Speed & Acceleration ----
@@ -332,6 +363,7 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         ("First layer acceleration:", "fff.first_layer_accel_mm_s2", f.first_layer_accel_mm_s2, 0.0, 15000.0, 250.0, 0, "mm/s²"),
         ("Max volumetric speed:", "fff.max_volumetric_speed_mm3_s", f.max_volumetric_speed_mm3_s, 0.0, 100.0, 1.0, 1, "mm³/s"),
     ])
+    tab.mark_advanced(g_acc)
     tab.add_section("Speed", make_page_container([g_spd, g_trv, g_acc]), "speed")
 
     # ---- 6. Wipe tower ----
@@ -353,7 +385,7 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
             w.setEnabled(en)
 
     tab.add_post_change_hook(_sync_wt)
-    tab.add_section("Wipe tower", make_page_container([g_wt]), "tower")
+    tab.add_section("Wipe tower", make_page_container([g_wt]), "tower", advanced=True)
 
     # ---- 7. Hybrid Mode, Resin Pump & Needle, and UV Hardening ----
     r, u, h = cfg.resin, cfg.uv, cfg.hybrid
@@ -434,9 +466,9 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         banner.style().polish(banner)
 
     tab.add_post_change_hook(_sync_hybrid_toggles)
-    tab.add_section("Hybrid Mode", make_page_container([g_hmode]), "uv")
-    tab.add_section("Resin Pump & Needle", make_page_container([g_pump]), "resin")
-    tab.add_section("UV Hardening", make_page_container([g_uv]), "uv")
+    tab.add_section("Hybrid Mode", make_page_container([g_hmode]), "uv", hybrid_only=True)
+    tab.add_section("Resin Pump & Needle", make_page_container([g_pump]), "resin", advanced=True, hybrid_only=True)
+    tab.add_section("UV Hardening", make_page_container([g_uv]), "uv", advanced=True, hybrid_only=True)
 
     # ---- 8. Advanced (Extrusion widths & Engine Precision) ----
     g_ew, few = make_card("Extrusion Width")
@@ -452,12 +484,13 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     ])
 
     g_eng2, fe = make_card("Slicing Engine && CAD Tessellation")
-    tab.add_dspin_rows(fe, [
+    sp_vox, sp_rast, _sp_sl, _sp_sa = tab.add_dspin_rows(fe, [
         ("3D SDF voxel pitch:", "voxel_pitch_mm", cfg.voxel_pitch_mm, 0.15, 2.0, 0.05, 2, "mm"),
         ("2D DP/BFS raster pitch:", "slice_raster_pitch_mm", cfg.slice_raster_pitch_mm, 0.10, 1.0, 0.05, 2, "mm"),
         ("STEP linear tolerance:", "step_tol_linear", cfg.step_tol_linear, 0.005, 0.5, 0.005, 3, "mm"),
         ("STEP angular tolerance:", "step_tol_angular", cfg.step_tol_angular, 0.01, 0.5, 0.01, 3, "rad"),
     ])
+    sp_vox_ref.append(sp_vox)
     note_eng = QLabel(
         "Outer and inner walls are always sliced in exact floating-point vector geometry. "
         "The raster pitch is used exclusively for DP airlock/shadow masks and 3D fluid basin BFS."
@@ -465,7 +498,9 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     note_eng.setObjectName("mutedLabel")
     note_eng.setWordWrap(True)
     fe.addRow(note_eng)
-    tab.add_section("Advanced", make_page_container([g_ew, g_eng2]), "settings")
+    tab.mark_hybrid_form_rows(fe, sp_vox, sp_rast)
+    tab.mark_hybrid_only(note_eng)
+    tab.add_section("Advanced", make_page_container([g_ew, g_eng2]), "settings", advanced=True)
 
     tab.load_from_config(cfg)
     return tab

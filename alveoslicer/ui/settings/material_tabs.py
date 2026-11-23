@@ -52,7 +52,7 @@ def build_filament_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig
     ])
     fr.addRow(tab.bind_checkbox("fff.wipe_on_retract", "Wipe while retracting", f.wipe_on_retract))
     fr.addRow(tab.bind_checkbox("fff.retract_on_layer_change", "Retract on layer change", f.retract_on_layer_change))
-    tab.add_section("Filament Overrides", make_page_container([g_ret]), "settings")
+    tab.add_section("Filament Overrides", make_page_container([g_ret]), "settings", advanced=True)
 
     tab.load_from_config(cfg)
     return tab
@@ -84,7 +84,7 @@ def build_resin_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         "resin.ghost_island_min_area_mm2", r.ghost_island_min_area_mm2, 0.0, 10.0, 0.05, 2, "mm²",
         tooltip="Tiny rasterized 2D islands below this area are skipped by the pump and their volume is merged into the touching or nearest real basin.",
     ))
-    tab.add_section("Fluid & Flow", make_page_container([g_fluid]), "resin")
+    tab.add_section("Fluid & Flow", make_page_container([g_fluid]), "resin", advanced=True)
 
     g_dp, fd = make_card("Global DP Cure-Cycle Scheduler")
     sp_xmin = tab.bind_spin("resin.x_min_layers", r.x_min_layers, 1, 20, 1, "layers")
@@ -104,7 +104,7 @@ def build_resin_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
             sp_xmax.setValue(sp_xmin.value())
 
     tab.add_post_change_hook(_clamp_window)
-    tab.add_section("Cure Schedule (DP)", make_page_container([g_dp]), "layers")
+    tab.add_section("Cure Schedule (DP)", make_page_container([g_dp]), "layers", advanced=True)
 
     tab.load_from_config(cfg)
     return tab

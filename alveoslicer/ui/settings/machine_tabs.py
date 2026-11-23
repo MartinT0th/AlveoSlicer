@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ...core.config import BED_SHAPES, GCODE_FLAVORS, SlicerConfig
+from ...core.config import BED_SHAPES, GCODE_FLAVORS, PRINTER_CAPABILITIES, SlicerConfig
 from ...core.presets import PresetManager
 from .base_tab import CategorySettingsTab, make_card, make_page_container
 
@@ -14,8 +14,20 @@ def build_printer_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig)
 
     # ---- 1. General ----
     g_gen, fg = make_card("Size, Coordinates && Firmware")
+    _cap_labels = {
+        "hybrid": "Hybrid (FFF + Photopolymer Resin + UV)",
+        "fff_only": "Standard FFF Only (No Resin / No UV)",
+    }
+    cb_cap = tab.bind_combo_mapped(
+        "printer.printer_capability",
+        [(c, _cap_labels.get(c, c)) for c in PRINTER_CAPABILITIES],
+        p.printer_capability,
+        tooltip="Select Hybrid to expose resin pumping/UV settings, or Standard FFF Only for regular 3D printers.",
+    )
+    fg.addRow("Printer capability:", cb_cap)
     cb_pr = tab.bind_combo("printer.printer_type", ["bedslinger_prototype", "corexy_toolchanger"], p.printer_type)
     fg.addRow("Printer HAL architecture:", cb_pr)
+    tab.mark_hybrid_form_rows(fg, cb_pr)
     fg.addRow("G-code flavor:", tab.bind_combo("printer.gcode_flavor", list(GCODE_FLAVORS), p.gcode_flavor))
     fg.addRow("Bed shape:", tab.bind_combo("printer.bed_shape", list(BED_SHAPES), p.bed_shape))
     tab.add_dspin_rows(fg, [
@@ -36,10 +48,13 @@ def build_printer_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig)
     g_ext, fe = make_card("Extruder && Tool Commands")
     fe.addRow("Nozzle diameter:", tab.bind_dspin("fff.nozzle_diameter", f.nozzle_diameter, 0.15, 1.5, 0.05, 2, "mm"))
     fe.addRow("FFF tool command:", tab.bind_line_edit("printer.tool_fff", p.tool_fff, fallback="T0"))
-    fe.addRow("Resin pump tool command:", tab.bind_line_edit("printer.tool_resin", p.tool_resin, fallback="T1"))
+    ed_resin_tool = tab.bind_line_edit("printer.tool_resin", p.tool_resin, fallback="T1")
+    fe.addRow("Resin pump tool command:", ed_resin_tool)
     ed_uv_tool = tab.bind_line_edit("printer.tool_uv", p.tool_uv, fallback="T2")
     fe.addRow("UV toolhead command:", ed_uv_tool)
-    fe.addRow("Resin pump axis:", tab.bind_line_edit("printer.resin_extruder_axis", p.resin_extruder_axis, fallback="E"))
+    ed_resin_axis = tab.bind_line_edit("printer.resin_extruder_axis", p.resin_extruder_axis, fallback="E")
+    fe.addRow("Resin pump axis:", ed_resin_axis)
+    tab.mark_hybrid_form_rows(fe, ed_resin_tool, ed_uv_tool, ed_resin_axis)
     tab.add_section("Extruder & Tools", make_page_container([g_ext]), "filament")
 
     # ---- 3. Machine Limits ----
@@ -66,7 +81,7 @@ def build_printer_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig)
         ("Max jerk Z:", "printer.max_jerk_z_mm_s", p.max_jerk_z_mm_s, 0.05, 10.0, 0.1, 2, "mm/s"),
         ("Max jerk E:", "printer.max_jerk_e_mm_s", p.max_jerk_e_mm_s, 0.1, 30.0, 0.5, 1, "mm/s"),
     ])
-    tab.add_section("Machine Limits", make_page_container([g_lim_f, g_lim_a, g_lim_j]), "speed")
+    tab.add_section("Machine Limits", make_page_container([g_lim_f, g_lim_a, g_lim_j]), "speed", advanced=True)
 
     # ---- 4. Custom G-code ----
     g_gc, fgc = make_card("Custom G-Code Hooks")
@@ -74,7 +89,7 @@ def build_printer_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig)
     fgc.addRow("End G-code:", tab.bind_plain_text("printer.end_gcode", p.end_gcode, "; Optional custom lines before cooldown/shutdown", 80))
     fgc.addRow("Before layer change:", tab.bind_plain_text("printer.before_layer_gcode", p.before_layer_gcode, "; Runs before each layer (supports {layer_num}, {layer_z})", 68))
     fgc.addRow("After layer change:", tab.bind_plain_text("printer.after_layer_gcode", p.after_layer_gcode, "; Runs after each layer (supports {layer_num}, {layer_z})", 68))
-    tab.add_section("Custom G-code", make_page_container([g_gc]), "gcode")
+    tab.add_section("Custom G-code", make_page_container([g_gc]), "gcode", advanced=True)
 
     # ---- 5. Needle & UV Offsets ----
     g_off, fo = make_card("Needle && Overhead UV Strip Offsets")
@@ -93,7 +108,7 @@ def build_printer_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig)
         ed_uv_tool.setEnabled(not is_bed)
 
     tab.add_post_change_hook(_sync_printer_type)
-    tab.add_section("Needle & UV Offsets", make_page_container([g_off]), "uv")
+    tab.add_section("Needle & UV Offsets", make_page_container([g_off]), "uv", advanced=True, hybrid_only=True)
 
     tab.load_from_config(cfg)
     return tab

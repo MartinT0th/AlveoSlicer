@@ -17,7 +17,7 @@ import numpy as np
 import shapely
 import trimesh
 from scipy import ndimage
-from shapely.geometry import LineString, MultiLineString, Point, Polygon
+from shapely.geometry import LineString, MultiLineString, Polygon
 from shapely.ops import linemerge
 from skimage import measure
 
@@ -36,10 +36,21 @@ from ..core.geometry import (
     split_mesh_bodies,
 )
 from ..infill.lattice import Capsule, NormalVoronoiLattice, clip_voronoi_cell_2d
-from ..infill.standard import generate_standard_infill_layer as _generate_standard_infill_layer
+from ..infill.standard import (
+    generate_standard_infill_layer as _generate_standard_infill_layer,
+    hatch_polygon as _hatch_polygon,
+)
 from .adhesion import _generate_skirt_and_brim, _generate_wipe_tower
 from .layer import SlicedLayer, _erode_3d_spherical_vector, _slice_mesh_plane_exact
 from .supports import _generate_dry_core_supports, _generate_external_supports
+
+def _polyline_length(coords: np.ndarray) -> float:
+    """Fast Euclidean length of a 2D polyline without allocating a Shapely LineString."""
+    if len(coords) < 2:
+        return 0.0
+    diffs = np.diff(coords, axis=0)
+    return float(np.hypot(diffs[:, 0], diffs[:, 1]).sum())
+
 
 def _filter_anchored_inside_perimeters(
     raw_lines: List[np.ndarray],
@@ -49,23 +60,32 @@ def _filter_anchored_inside_perimeters(
 ) -> List[np.ndarray]:
     """Keep closed loops and open wall-to-wall spans whose both endpoints anchor into the walls."""
     kept: List[np.ndarray] = []
+    open_cands: List[np.ndarray] = []
     for coords in raw_lines:
         if len(coords) < 2:
             continue
         p_start = coords[0]
         p_end = coords[-1]
         is_closed = math.hypot(float(p_end[0] - p_start[0]), float(p_end[1] - p_start[1])) < 1e-3
+        if _polyline_length(coords) < min_open_len:
+            continue
         if is_closed:
-            if LineString(coords).length >= min_open_len:
-                kept.append(coords)
-            continue
-
-        if LineString(coords).length < min_open_len:
-            continue
-        d0 = anchor_boundary.distance(Point(float(p_start[0]), float(p_start[1])))
-        d1 = anchor_boundary.distance(Point(float(p_end[0]), float(p_end[1])))
-        if d0 <= anchor_tol and d1 <= anchor_tol:
             kept.append(coords)
+        else:
+            open_cands.append(coords)
+
+    if open_cands:
+        end_pts = shapely.points(
+            np.array(
+                [[c[0, 0], c[0, 1]] for c in open_cands] + [[c[-1, 0], c[-1, 1]] for c in open_cands],
+                dtype=np.float64,
+            )
+        )
+        dists = shapely.distance(anchor_boundary, end_pts)
+        m = len(open_cands)
+        for i, coords in enumerate(open_cands):
+            if dists[i] <= anchor_tol and dists[m + i] <= anchor_tol:
+                kept.append(coords)
     return kept
 
 
@@ -82,6 +102,25 @@ def _slice_layer_cells(
     fillet_r: float,
 ) -> Tuple[shapely.Geometry, shapely.Geometry, shapely.Geometry, List[np.ndarray]]:
     """Slice active 3D cellular cells (or analytical Gyroid TPMS) at ``z_mid`` into formwork, caps, air, & resin."""
+    outer_guard = safe_buffer(p_mod, -0.5 * lw, join_style=2)
+    p_comp_anchor = safe_intersection(safe_buffer(p_comp, 0.50 * lw, join_style=2), outer_guard)
+    if not p_dry.is_empty:
+        p_comp_anchor = safe_difference(p_comp_anchor, safe_buffer(p_dry, 0.5 * lw, join_style=2))
+    if p_comp_anchor.is_empty:
+        p_comp_anchor = p_comp
+
+    if getattr(lattice, "generator", "") == "planar_25d":
+        return _slice_planar_25d_layer(
+            pattern=getattr(lattice, "pattern", "hexagonal"),
+            pitch=getattr(lattice, "pitch", 10.0),
+            z_mid=z_mid,
+            p_comp=p_comp,
+            p_comp_anchor=p_comp_anchor,
+            lw=lw,
+            w_resin=w_resin,
+            t_cell_wall=t_cell_wall,
+        )
+
     if getattr(lattice, "pattern", "") == "gyroid":
         return _slice_gyroid_layer(
             pitch=getattr(lattice, "pitch", 10.0),
@@ -99,14 +138,10 @@ def _slice_layer_cells(
     cell_cap_list: List[shapely.Geometry] = []
     inside_perims: List[np.ndarray] = []
 
-    # Anchor band embeds 0.50*lw INTO both outer and inner walls for watertight bonding
-    outer_guard = safe_buffer(p_mod, -0.5 * lw, join_style=2)
-    p_comp_anchor = clean_geom(safe_intersection(safe_buffer(p_comp, 0.50 * lw, join_style=2), outer_guard))
-    if not p_dry.is_empty:
-        p_comp_anchor = safe_difference(p_comp_anchor, safe_buffer(p_dry, 0.5 * lw, join_style=2))
-    if p_comp_anchor.is_empty:
-        p_comp_anchor = p_comp
     anchor_boundary = p_comp_anchor.boundary
+    shapely.prepare(p_comp)
+    shapely.prepare(p_comp_anchor)
+    shapely.prepare(anchor_boundary)
 
     bx0, by0, bx1, by1 = p_comp_anchor.bounds
     bbox = (bx0 - 1.0, by0 - 1.0, bx1 + 1.0, by1 + 1.0)
@@ -116,21 +151,26 @@ def _slice_layer_cells(
     for sid in active_seeds:
         planes = lattice.cell_planes[int(sid)]
         raw_outer = clip_voronoi_cell_2d(planes, z_mid, 0.5 * w_resin, bbox)
-        if raw_outer is None:
+        if raw_outer is None or not shapely.intersects(raw_outer, p_comp):
             continue
 
         if fillet_r > 0.05:
             r_eff = min(fillet_r, 0.25 * math.sqrt(raw_outer.area))
             if r_eff > 0.05:
-                rounded = safe_buffer(safe_buffer(raw_outer, -r_eff, join_style=1), r_eff, join_style=1)
+                rounded = safe_buffer(
+                    safe_buffer(raw_outer, -r_eff, join_style=1, quad_segs=6),
+                    r_eff,
+                    join_style=1,
+                    quad_segs=6,
+                )
                 if not rounded.is_empty:
                     raw_outer = rounded
 
-        clipped_outer = clean_geom(safe_intersection(raw_outer, p_comp))
+        clipped_outer = safe_intersection(raw_outer, p_comp)
         if clipped_outer.is_empty or clipped_outer.area < 0.12:
             continue
 
-        clipped_outer_anchor = clean_geom(safe_intersection(raw_outer, p_comp_anchor))
+        clipped_outer_anchor = safe_intersection(raw_outer, p_comp_anchor)
         if clipped_outer_anchor.is_empty:
             continue
 
@@ -138,8 +178,8 @@ def _slice_layer_cells(
         raw_air = clip_voronoi_cell_2d(planes, z_mid, 0.5 * w_resin + t_cell_wall, bbox)
         if raw_air is not None:
             eroded_2d = safe_buffer(raw_outer, -t_cell_wall, join_style=2)
-            raw_air = clean_geom(safe_intersection(raw_air, eroded_2d)) if not eroded_2d.is_empty else Polygon()
-            clipped_air = clean_geom(safe_intersection(raw_air, p_comp)) if not raw_air.is_empty else Polygon()
+            raw_air = safe_intersection(raw_air, eroded_2d) if not eroded_2d.is_empty else Polygon()
+            clipped_air = safe_intersection(raw_air, p_comp) if not raw_air.is_empty else Polygon()
         else:
             clipped_air = Polygon()
 
@@ -155,7 +195,7 @@ def _slice_layer_cells(
             if loop_3d is None:
                 continue
             loop_2d = safe_buffer(raw_outer, -d_off, join_style=2)
-            loop_poly = clean_geom(safe_intersection(loop_3d, loop_2d)) if not loop_2d.is_empty else Polygon()
+            loop_poly = safe_intersection(loop_3d, loop_2d) if not loop_2d.is_empty else Polygon()
             if loop_poly.is_empty or loop_poly.area < 0.02:
                 continue
             clipped_arcs = safe_intersection(loop_poly.boundary, p_comp_anchor)
@@ -175,9 +215,7 @@ def _slice_layer_cells(
 
         if raw_air is not None and not raw_air.is_empty:
             wall_strip = safe_difference(clipped_outer_anchor, raw_air)
-            covered = safe_union(
-                [safe_buffer(LineString(ln), 0.60 * lw, cap_style=2) for ln in anchored_lines]
-            )
+            covered = safe_buffer(MultiLineString(anchored_lines), 0.60 * lw, cap_style=2, quad_segs=3)
             extra_ramp = safe_difference(wall_strip, covered)
             if not extra_ramp.is_empty and extra_ramp.area > lw * lw:
                 cell_cap_list.append(extra_ramp)
@@ -203,7 +241,7 @@ def _slice_gyroid_layer(
     at ``z_mid`` into smooth sinusoidal wall toolpaths separating resin & air channels.
     """
     outer_guard = safe_buffer(p_mod, -0.5 * lw, join_style=2)
-    p_comp_anchor = clean_geom(safe_intersection(safe_buffer(p_comp, 0.50 * lw, join_style=2), outer_guard))
+    p_comp_anchor = safe_intersection(safe_buffer(p_comp, 0.50 * lw, join_style=2), outer_guard)
     if not p_dry.is_empty:
         p_comp_anchor = safe_difference(p_comp_anchor, safe_buffer(p_dry, 0.5 * lw, join_style=2))
     if p_comp_anchor.is_empty:
@@ -223,25 +261,166 @@ def _slice_gyroid_layer(
 
     # Map physical wall/channel thickness into TPMS iso-level offset (|grad F| ~= 1.2 * k)
     iso_offset = min(0.75, max(0.15, 0.5 * w_resin * k * 0.75))
-    inside_perims: List[np.ndarray] = []
-    wall_polys: List[shapely.Geometry] = []
-
+    raw_lines: List[shapely.Geometry] = []
     for level in (-iso_offset, iso_offset):
-        contours = measure.find_contours(val, level)
-        for c in contours:
+        for c in measure.find_contours(val, level):
             if len(c) < 2:
                 continue
             pts = np.column_stack([xs[0] + c[:, 0] * step, ys[0] + c[:, 1] * step])
-            ls = LineString(pts).simplify(0.08, preserve_topology=False)
-            clipped = safe_intersection(ls, p_comp_anchor)
-            for seg in extract_polylines(clipped):
-                if LineString(seg).length >= 1.5 * lw:
-                    inside_perims.append(seg)
-                    wall_polys.append(safe_buffer(LineString(seg), 0.5 * max(lw, t_cell_wall), cap_style=2))
+            raw_lines.append(LineString(pts).simplify(0.08, preserve_topology=False))
+
+    min_len = 1.5 * lw
+    inside_perims: List[np.ndarray] = []
+    if raw_lines:
+        clipped = safe_intersection(MultiLineString(raw_lines), p_comp_anchor)
+        for seg in extract_polylines(clipped):
+            if _polyline_length(seg) >= min_len:
+                inside_perims.append(seg)
 
     # Regions with |F| > iso_offset are enclosed air cells; |F| <= iso_offset is continuous resin channel
-    cell_outer = safe_union(wall_polys) if wall_polys else Polygon()
+    cell_outer = (
+        safe_buffer(MultiLineString(inside_perims), 0.5 * max(lw, t_cell_wall), cap_style=2, quad_segs=3)
+        if inside_perims
+        else Polygon()
+    )
     return cell_outer, Polygon(), Polygon(), inside_perims
+
+
+def _slice_planar_25d_layer(
+    pattern: str,
+    pitch: float,
+    z_mid: float,
+    p_comp: shapely.Geometry,
+    p_comp_anchor: shapely.Geometry,
+    lw: float,
+    w_resin: float,
+    t_cell_wall: float,
+) -> Tuple[shapely.Geometry, shapely.Geometry, shapely.Geometry, List[np.ndarray]]:
+    """Ultra-fast 2.5D Layer-Direct formwork with self-supporting <=34 deg Z-phase ribs & open resin channels."""
+    sp = max(w_resin + t_cell_wall + lw, float(pitch) * 0.72)
+    slope_tan = 0.60  # max dx/dz = 0.60 -> ~59 deg wall slope from horizontal (100% self-supporting)
+    phase_a = (slope_tan * z_mid) % sp
+    phase_b = (-slope_tan * z_mid) % sp
+
+    if pattern in ("square", "brick"):
+        angles_phases = ((0.0, phase_a), (90.0, phase_b))
+    elif pattern == "diamond":
+        angles_phases = ((45.0, phase_a), (-45.0, phase_b))
+    else:
+        angles_phases = ((60.0, phase_a), (-60.0, phase_b))
+
+    inside_perims: List[np.ndarray] = []
+    min_len = 1.5 * lw
+    for ang, ph in angles_phases:
+        for coords in _hatch_polygon(p_comp_anchor, sp, ang, phase=ph, alternating=True, min_area=0.05):
+            if _polyline_length(coords) >= min_len:
+                inside_perims.append(coords)
+
+    cell_outer = (
+        safe_buffer(MultiLineString(inside_perims), 0.5 * max(lw, t_cell_wall), cap_style=2, quad_segs=2)
+        if inside_perims
+        else Polygon()
+    )
+    all_cells = safe_intersection(cell_outer, p_comp) if not cell_outer.is_empty else Polygon()
+    return all_cells, Polygon(), Polygon(), inside_perims
+
+
+def _enforce_printable_internal_overhangs(
+    shell_geoms: List[shapely.Geometry],
+    cell_wall_geoms: List[shapely.Geometry],
+    inside_perims_all: List[List[np.ndarray]],
+    cell_cap_geoms: List[shapely.Geometry],
+    dry_support_lines_all: List[List[np.ndarray]],
+    dry_support_polys_all: List[shapely.Geometry],
+    layer_heights: List[float],
+    lw: float,
+    max_bridge_span: float,
+) -> None:
+    """
+    Bottom-up printability verification & repair pass:
+      - Clips any unanchored floating internal cantilevers beyond a self-supporting overhang
+        stepout so extruded lines always rest on solid geometry below or bridge <= ``max_bridge_span``
+        between two anchored endpoints.
+      - Adds downward dry-core support ribs beneath any oversized unsupported cap spans.
+    """
+    n_layers = len(shell_geoms)
+    if n_layers < 2:
+        return
+
+    tan42 = math.tan(math.radians(42.0))
+    for k in range(1, n_layers):
+        hk = max(0.05, layer_heights[k])
+        max_step = min(hk / tan42, 0.90 * lw)
+        below_parts = [shell_geoms[k - 1]]
+        if not cell_wall_geoms[k - 1].is_empty:
+            below_parts.append(cell_wall_geoms[k - 1])
+        if not dry_support_polys_all[k - 1].is_empty:
+            below_parts.append(dry_support_polys_all[k - 1])
+        solid_below = safe_union([g for g in below_parts if not g.is_empty])
+        if solid_below.is_empty:
+            continue
+
+        supported_xy = safe_buffer(solid_below, max_step, join_style=2)
+        anchor_zone = safe_buffer(safe_union([supported_xy, shell_geoms[k]]), 0.35 * lw, join_style=2)
+        shapely.prepare(supported_xy)
+        shapely.prepare(anchor_zone)
+
+        raw_lines = inside_perims_all[k]
+        if raw_lines:
+            repaired_lines: List[np.ndarray] = []
+            changed = False
+            for coords in raw_lines:
+                if len(coords) < 2:
+                    continue
+                ls = LineString(coords)
+                if shapely.covers(anchor_zone, ls):
+                    repaired_lines.append(coords)
+                    continue
+                p0_ok = shapely.contains_xy(anchor_zone, float(coords[0, 0]), float(coords[0, 1]))
+                p1_ok = shapely.contains_xy(anchor_zone, float(coords[-1, 0]), float(coords[-1, 1]))
+                if p0_ok and p1_ok and ls.length <= max_bridge_span:
+                    repaired_lines.append(coords)
+                    continue
+
+                # Trim floating mid-air cantilever segments to supported footprint
+                changed = True
+                clipped = safe_intersection(ls, anchor_zone)
+                for seg in extract_polylines(clipped):
+                    if _polyline_length(seg) >= 1.5 * lw:
+                        repaired_lines.append(seg)
+
+            if changed:
+                inside_perims_all[k] = repaired_lines
+                valid_lines = [ln for ln in repaired_lines if len(ln) >= 2]
+                wall_buf = (
+                    safe_buffer(MultiLineString(valid_lines), 0.5 * lw, cap_style=2, quad_segs=3)
+                    if valid_lines
+                    else Polygon()
+                )
+                cap_k = cell_cap_geoms[k]
+                if not cap_k.is_empty:
+                    cell_wall_geoms[k] = safe_union([wall_buf, cap_k]) if not wall_buf.is_empty else cap_k
+                else:
+                    cell_wall_geoms[k] = wall_buf
+
+        # Guard oversized unsupported flat caps by keeping only supported/bridgeable bands
+        cap_k = cell_cap_geoms[k]
+        if not cap_k.is_empty and cap_k.area > 0.25:
+            unsup_cap = safe_difference(cap_k, anchor_zone)
+            if not unsup_cap.is_empty:
+                oversized = [
+                    p
+                    for p in iter_polygons(unsup_cap, min_area=0.25)
+                    if min(p.bounds[2] - p.bounds[0], p.bounds[3] - p.bounds[1]) > max_bridge_span
+                ]
+                if oversized:
+                    # Trim unbridgeable cantilever cap extensions back into supported+bridge zone
+                    bridge_reach = safe_buffer(anchor_zone, 0.5 * max_bridge_span, join_style=2)
+                    trimmed_cap = safe_intersection(cap_k, bridge_reach)
+                    cell_cap_geoms[k] = trimmed_cap
+                    cell_wall_geoms[k] = safe_union(
+                        [safe_difference(cell_wall_geoms[k], unsup_cap), trimmed_cap]
+                    )
 
 
 @dataclass
@@ -260,6 +439,8 @@ class _BodySliceData:
     ext_support_lines: List[List[np.ndarray]]
     ext_support_interface_lines: List[List[np.ndarray]]
     top_surface_geom: List[shapely.Geometry]
+    overhang_geom: List[shapely.Geometry]
+    bridge_geom: List[shapely.Geometry]
 
 
 def _slice_single_body_layers(
@@ -283,7 +464,7 @@ def _slice_single_body_layers(
     t_cell_wall = max(lw, 2.0 * cfg.infill.strut_radius)
     n_inside_perims = max(1, int(round(t_cell_wall / lw)))
     fillet_r = max(0.0, cfg.infill.smin_blend_radius)
-    use_standard_infill = str(cfg.infill.infill_engine).lower() == "standard"
+    use_standard_infill = (str(cfg.infill.infill_engine).lower() == "standard") or (not cfg.is_hybrid_printer)
     num_layers = len(layer_heights)
 
     # 1. Exact vector mesh slicing for this body + XY Size, XY Hole & Elephant Foot compensations
@@ -334,6 +515,8 @@ def _slice_single_body_layers(
     inner_skin_geoms: List[shapely.Geometry] = []
     dry_core_geoms: List[shapely.Geometry] = []
     top_surface_geoms: List[shapely.Geometry] = []
+    overhang_geoms: List[shapely.Geometry] = []
+    bridge_geoms: List[shapely.Geometry] = []
 
     b_bot = max(0, int(f.bottom_solid_layers))
     if b_bot > 0 and f.min_bottom_shell_thickness_mm > 0.0:
@@ -343,6 +526,8 @@ def _slice_single_body_layers(
     if b_top > 0 and f.min_top_shell_thickness_mm > 0.0:
         b_top = max(b_top, int(math.ceil(f.min_top_shell_thickness_mm / h)))
 
+    erode_cache: dict[Tuple[int, int], shapely.Geometry] = {}
+    tan45 = 1.0
     for k in range(num_layers):
         p_mod = outer_polys[k]
         if p_mod.is_empty:
@@ -351,6 +536,8 @@ def _slice_single_body_layers(
             inner_skin_geoms.append(Polygon())
             dry_core_geoms.append(Polygon())
             top_surface_geoms.append(Polygon())
+            overhang_geoms.append(Polygon())
+            bridge_geoms.append(Polygon())
             continue
 
         if k >= body_top_layer or k == num_layers - 1:
@@ -359,6 +546,13 @@ def _slice_single_body_layers(
             top_surf = safe_difference(p_mod, outer_polys[k + 1])
         top_surface_geoms.append(top_surf)
 
+        ov_k: shapely.Geometry = Polygon()
+        br_k: shapely.Geometry = Polygon()
+        if k >= 1 and not outer_polys[k - 1].is_empty:
+            max_ov_step = min(layer_heights[k] / tan45, 0.85 * lw_perim)
+            sup_base = safe_buffer(outer_polys[k - 1], max_ov_step, join_style=2)
+            ov_k = safe_difference(p_mod, sup_base)
+
         if f.spiral_vase:
             p_in_outer = Polygon() if k < b_bot else safe_buffer(p_mod, -outer_shell, join_style=2)
             p_inner_skin = Polygon()
@@ -366,7 +560,7 @@ def _slice_single_body_layers(
             p_comp = Polygon()
             p_shell = safe_difference(p_mod, p_in_outer) if not p_in_outer.is_empty else p_mod
         else:
-            p_in_outer = _erode_3d_spherical_vector(outer_polys, k, outer_shell, h)
+            p_in_outer = _erode_3d_spherical_vector(outer_polys, k, outer_shell, h, erode_cache)
             if k < b_bot or (b_top > 0 and (k + b_top) > body_top_layer):
                 p_in_outer = Polygon()
             else:
@@ -375,10 +569,16 @@ def _slice_single_body_layers(
                 if b_top > 0:
                     p_in_outer = safe_intersection(p_in_outer, outer_polys[k + b_top])
 
+            # Thicken overhanging perimeter wall inward by 1 perimeter width to anchor slanted walls
+            if f.extra_perimeters_on_overhangs and not ov_k.is_empty and not p_in_outer.is_empty:
+                ov_anchor = safe_intersection(safe_buffer(ov_k, lw_perim, join_style=2), p_in_outer)
+                if not ov_anchor.is_empty and ov_anchor.area > 0.05:
+                    p_in_outer = safe_difference(p_in_outer, ov_anchor)
+
             if (not use_standard_infill) and cfg.infill.mode == "hollow_shell" and not p_in_outer.is_empty:
-                p_core_outer = _erode_3d_spherical_vector(outer_polys, k, outer_shell + hollow_wall, h)
+                p_core_outer = _erode_3d_spherical_vector(outer_polys, k, outer_shell + hollow_wall, h, erode_cache)
                 p_dry = _erode_3d_spherical_vector(
-                    outer_polys, k, outer_shell + hollow_wall + inner_skin, h
+                    outer_polys, k, outer_shell + hollow_wall + inner_skin, h, erode_cache
                 )
                 p_inner_skin = (
                     safe_difference(p_core_outer, p_dry) if not p_core_outer.is_empty else Polygon()
@@ -395,10 +595,22 @@ def _slice_single_body_layers(
                 p_comp = p_in_outer
                 p_shell = safe_difference(p_mod, p_in_outer)
 
-        comp_geoms.append(clean_geom(p_comp))
-        shell_geoms.append(clean_geom(p_shell))
-        inner_skin_geoms.append(clean_geom(p_inner_skin))
-        dry_core_geoms.append(clean_geom(p_dry))
+            # Detect bottom-facing unsupported solid skins (bridges over internal voids or overhang undersides)
+            if k >= 1 and not outer_polys[k - 1].is_empty and not p_shell.is_empty:
+                p_core_wall = safe_buffer(p_mod, -outer_shell, join_style=2)
+                if not p_core_wall.is_empty:
+                    solid_roof = safe_intersection(p_shell, p_core_wall)
+                    if not solid_roof.is_empty:
+                        unsup_roof = safe_difference(solid_roof, outer_polys[k - 1])
+                        if not unsup_roof.is_empty and unsup_roof.area > 0.15:
+                            br_k = unsup_roof
+
+        comp_geoms.append(p_comp)
+        shell_geoms.append(p_shell)
+        inner_skin_geoms.append(p_inner_skin)
+        dry_core_geoms.append(p_dry)
+        overhang_geoms.append(ov_k)
+        bridge_geoms.append(br_k)
 
     # Optional downward roof-projection masks for Lightning / Only-infill-where-needed
     roof_proj_masks: List[shapely.Geometry] = [Polygon() for _ in range(num_layers)]
@@ -410,7 +622,7 @@ def _slice_single_body_layers(
             if not top_surface_geoms[k].is_empty:
                 acc_roof = safe_union([acc_roof, top_surface_geoms[k]]) if not acc_roof.is_empty else top_surface_geoms[k]
             if not acc_roof.is_empty and not comp_geoms[k].is_empty:
-                acc_roof = clean_geom(safe_intersection(acc_roof, outer_polys[k]))
+                acc_roof = safe_intersection(acc_roof, outer_polys[k])
                 roof_proj_masks[k] = acc_roof
 
     # 3. Per-body dry-core supports and external overhang supports (respecting this body's paint_support)
@@ -458,14 +670,16 @@ def _slice_single_body_layers(
             inside_perims_k = std_lines
             cell_cap_geom = solid_diaph
             empty_cells_geom = Polygon()
-            wall_geoms_preview = [
-                safe_buffer(LineString(ln), 0.5 * lw_infill, cap_style=2)
-                for ln in inside_perims_k
-                if len(ln) >= 2
-            ]
+            valid_lines = [ln for ln in inside_perims_k if len(ln) >= 2]
+            wall_buf = (
+                safe_buffer(MultiLineString(valid_lines), 0.5 * lw_infill, cap_style=2, quad_segs=3)
+                if valid_lines
+                else Polygon()
+            )
             if not cell_cap_geom.is_empty:
-                wall_geoms_preview.append(cell_cap_geom)
-            cell_wall_geom = safe_union(wall_geoms_preview) if wall_geoms_preview else Polygon()
+                cell_wall_geom = safe_union([wall_buf, cell_cap_geom]) if not wall_buf.is_empty else cell_cap_geom
+            else:
+                cell_wall_geom = wall_buf
             all_cells_outer = cell_wall_geom
         elif has_lattice and not p_comp.is_empty and p_comp.area > 0.1:
             assert isinstance(body_lattice, NormalVoronoiLattice)
@@ -481,16 +695,16 @@ def _slice_single_body_layers(
                 n_inside_perims=n_inside_perims,
                 fillet_r=fillet_r,
             )
-            wall_geoms_preview = []
-            if inside_perims_k:
-                wall_geoms_preview.extend(
-                    safe_buffer(LineString(ln), 0.5 * lw, cap_style=2)
-                    for ln in inside_perims_k
-                    if len(ln) >= 2
-                )
+            valid_lines = [ln for ln in inside_perims_k if len(ln) >= 2]
+            wall_buf = (
+                safe_buffer(MultiLineString(valid_lines), 0.5 * lw, cap_style=2, quad_segs=3)
+                if valid_lines
+                else Polygon()
+            )
             if not cell_cap_geom.is_empty:
-                wall_geoms_preview.append(cell_cap_geom)
-            cell_wall_geom = safe_union(wall_geoms_preview) if wall_geoms_preview else Polygon()
+                cell_wall_geom = safe_union([wall_buf, cell_cap_geom]) if not wall_buf.is_empty else cell_cap_geom
+            else:
+                cell_wall_geom = wall_buf
         else:
             all_cells_outer = Polygon()
             empty_cells_geom = Polygon()
@@ -499,7 +713,9 @@ def _slice_single_body_layers(
             cell_wall_geom = Polygon()
 
         resin_void_geom = (
-            safe_difference(p_comp, all_cells_outer) if not p_comp.is_empty else Polygon()
+            safe_difference(p_comp, all_cells_outer)
+            if (not cfg.effective_is_fff_only and not p_comp.is_empty)
+            else Polygon()
         )
 
         cell_wall_geoms.append(cell_wall_geom)
@@ -507,6 +723,19 @@ def _slice_single_body_layers(
         cell_cap_geoms.append(cell_cap_geom)
         empty_cell_geoms.append(empty_cells_geom)
         resin_void_geoms.append(resin_void_geom)
+
+    if not use_standard_infill and not f.spiral_vase:
+        _enforce_printable_internal_overhangs(
+            shell_geoms=shell_geoms,
+            cell_wall_geoms=cell_wall_geoms,
+            inside_perims_all=inside_perims_all,
+            cell_cap_geoms=cell_cap_geoms,
+            dry_support_lines_all=dry_support_lines_all,
+            dry_support_polys_all=dry_support_polys_all,
+            layer_heights=layer_heights,
+            lw=lw,
+            max_bridge_span=max(2.0, float(cfg.infill.max_bridge_span)),
+        )
 
     return _BodySliceData(
         outer_geom=outer_polys,
@@ -521,6 +750,8 @@ def _slice_single_body_layers(
         ext_support_lines=ext_sup_lines_all,
         ext_support_interface_lines=ext_iface_lines_all,
         top_surface_geom=top_surface_geoms,
+        overhang_geom=overhang_geoms,
+        bridge_geom=bridge_geoms,
     )
 
 
@@ -611,6 +842,8 @@ def slice_model_to_layers(
         ext_sup_merged = b0.ext_support_lines
         ext_iface_merged = b0.ext_support_interface_lines
         top_surf_merged = b0.top_surface_geom
+        overhang_merged = b0.overhang_geom
+        bridge_merged = b0.bridge_geom
     else:
         outer_merged = [safe_union([bs.outer_geom[k] for bs in body_slices]) for k in range(num_layers)]
         shell_merged = [safe_union([bs.shell_geom[k] for bs in body_slices]) for k in range(num_layers)]
@@ -632,6 +865,8 @@ def slice_model_to_layers(
             [ln for bs in body_slices for ln in bs.ext_support_interface_lines[k]] for k in range(num_layers)
         ]
         top_surf_merged = [safe_union([bs.top_surface_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        overhang_merged = [safe_union([bs.overhang_geom[k] for bs in body_slices]) for k in range(num_layers)]
+        bridge_merged = [safe_union([bs.bridge_geom[k] for bs in body_slices]) for k in range(num_layers)]
 
     # Plate-level Skirt/Brim (wraps all objects cleanly) & Wipe Tower
     skirt_brim_all = _generate_skirt_and_brim(
@@ -643,6 +878,47 @@ def slice_model_to_layers(
     wipe_tower_all = _generate_wipe_tower(num_layers, layer_heights, cfg)
 
     layers: List[SlicedLayer] = []
+    # Optional Raft Layers (FFF support_raft_layers > 0): prepend adhesion + interface layers beneath part
+    n_raft = max(0, int(f.support_raft_layers))
+    raft_z_shift = 0.0
+    if n_raft > 0 and num_layers > 0 and not outer_merged[0].is_empty:
+        raft_base = safe_buffer(
+            outer_merged[0], max(1.0, float(f.support_first_layer_expansion_mm)), join_style=1
+        )
+        lw_sup = max(0.25, float(f.support_line_width or f.line_width))
+        iface_sp = max(0.35, float(f.support_interface_spacing_mm))
+        sup_sp = max(0.8, float(f.support_spacing_mm))
+        empty_m = np.zeros_like(gx, dtype=bool)
+        z_r = 0.0
+        for r_idx in range(n_raft):
+            rh = h_first if r_idx == 0 else h
+            z_r += rh
+            r_sheath = [np.asarray(p.exterior.coords, dtype=np.float64) for p in iter_polygons(safe_buffer(raft_base, -0.5 * lw_sup, join_style=1))]
+            is_top_raft = r_idx == n_raft - 1
+            r_fill = _hatch_polygon(
+                raft_base,
+                iface_sp if (is_top_raft or r_idx == 0) else sup_sp,
+                45.0 if (r_idx % 2 == 0) else -45.0,
+            )
+            layers.append(
+                SlicedLayer(
+                    layer_idx=len(layers) + 1,
+                    z=z_r,
+                    solid_mask=empty_m,
+                    shell_mask=empty_m,
+                    infill_mask=empty_m,
+                    dry_support_mask=empty_m,
+                    void_mask=empty_m,
+                    accessible_mask=empty_m,
+                    layer_height=rh,
+                    skirt_brim_lines=skirt_brim_all[0] if r_idx == 0 else [],
+                    ext_support_lines=(r_sheath + r_fill) if not is_top_raft else [],
+                    ext_support_interface_lines=(r_sheath + r_fill) if is_top_raft else [],
+                )
+            )
+        skirt_brim_all[0] = []
+        raft_z_shift = z_r + max(0.0, float(f.support_z_distance_mm))
+
     for k in range(num_layers):
         p_mod = outer_merged[k]
         p_shell = shell_merged[k]
@@ -654,17 +930,21 @@ def slice_model_to_layers(
         infill_m = rasterize_geom(cell_wall_geom, gx, gy) & (~shell_m)
         solid_m = shell_m | infill_m
         dry_m = rasterize_geom(dry_polys_merged[k], gx, gy) & (~solid_m)
-        void_m = rasterize_geom(resin_void_geom, gx, gy) & (~solid_m)
-        acc_m = (
-            ndimage.binary_erosion(void_m, structure=needle_disk)
-            if np.any(void_m)
-            else np.zeros_like(void_m)
-        )
+        if cfg.effective_is_fff_only:
+            void_m = np.zeros_like(shell_m)
+            acc_m = void_m
+        else:
+            void_m = rasterize_geom(resin_void_geom, gx, gy) & (~solid_m)
+            acc_m = (
+                ndimage.binary_erosion(void_m, structure=needle_disk)
+                if np.any(void_m)
+                else np.zeros_like(void_m)
+            )
 
         layers.append(
             SlicedLayer(
-                layer_idx=k + 1,
-                z=z_tops[k],
+                layer_idx=len(layers) + 1,
+                z=z_tops[k] + raft_z_shift,
                 solid_mask=solid_m,
                 shell_mask=shell_m,
                 infill_mask=infill_m,
@@ -686,6 +966,8 @@ def slice_model_to_layers(
                 wipe_tower_lines=wipe_tower_all[k],
                 is_top_solid_layer=(k == num_layers - 1),
                 top_surface_geom=top_surf_merged[k],
+                overhang_geom=overhang_merged[k],
+                bridge_geom=bridge_merged[k],
             )
         )
 

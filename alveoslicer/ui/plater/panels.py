@@ -9,9 +9,10 @@ synchronization and user interactions.
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, List, Sequence, Tuple
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QRectF, Qt
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
 
 from ...core.presets import CATEGORY_LABELS, PRESET_CATEGORIES
 from ...gcode.parser import DOSING_COLOR, FEATURE_COLORS, FEATURE_TYPES, TRAVEL_COLOR
+from ..styling.theme import get_palette
 from ..styling.widgets import make_double_spin, wrap_scroll
 
 if TYPE_CHECKING:
@@ -267,11 +270,14 @@ def build_legend_card(view: "PlaterView") -> QFrame:
     title.setObjectName("sectionTitle")
     vbox.addWidget(title)
 
+    view._legend_row_widgets = {}
+
     def _swatch_row(
         color_rgb: Tuple[float, float, float],
         label: str,
         checked: bool,
         bordered: bool = False,
+        tag: str = "",
     ) -> QCheckBox:
         row = QHBoxLayout()
         row.setSpacing(6)
@@ -285,10 +291,12 @@ def build_legend_card(view: "PlaterView") -> QFrame:
         row.addWidget(swatch)
         row.addWidget(chk, stretch=1)
         vbox.addLayout(row)
+        if tag:
+            view._legend_row_widgets[tag] = [swatch, chk]
         return chk
 
     view._feature_checks: Dict[int, QCheckBox] = {
-        idx: _swatch_row(FEATURE_COLORS[name], name, checked=True, bordered=True)
+        idx: _swatch_row(FEATURE_COLORS[name], name, checked=True, bordered=True, tag=name)
         for idx, name in enumerate(FEATURE_TYPES)
     }
 
@@ -301,7 +309,7 @@ def build_legend_card(view: "PlaterView") -> QFrame:
     vbox.addWidget(lbl_ov)
 
     view.chk_travels = _swatch_row(TRAVEL_COLOR, "Travel moves", checked=False)
-    view.chk_dosing = _swatch_row(DOSING_COLOR, "Resin dosing", checked=True)
+    view.chk_dosing = _swatch_row(DOSING_COLOR, "Resin dosing", checked=True, tag="Resin dosing")
 
     vbox.addStretch(1)
 
@@ -315,13 +323,69 @@ def build_legend_card(view: "PlaterView") -> QFrame:
     return card
 
 
+class CureCadenceStrip(QWidget):
+    """Compact optical cadence bar visualizing FFF layer progression and UV cure pulses."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(10)
+        self._num_layers = 0
+        self._cure_layers: List[int] = []
+        self._resolved_mode = "dark"
+        self.setToolTip("UV cure cadence across sliced layers")
+
+    def set_theme(self, resolved_mode: str) -> None:
+        self._resolved_mode = resolved_mode
+        self.update()
+
+    def set_schedule(self, num_layers: int, cure_layers: Sequence[int]) -> None:
+        self._num_layers = max(0, int(num_layers))
+        self._cure_layers = sorted(set(int(x) for x in cure_layers if 1 <= int(x) <= self._num_layers))
+        if self._num_layers <= 0:
+            self.setToolTip("Slice a build plate to inspect UV cure cadence")
+        elif self._cure_layers:
+            self.setToolTip(
+                f"{len(self._cure_layers)} UV cure cycles across {self._num_layers} layers"
+            )
+        else:
+            self.setToolTip(f"Standard FFF — {self._num_layers} layers (no UV cure cycles)")
+        self.update()
+
+    def paintEvent(self, event) -> None:  # type: ignore[override]
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pal = get_palette(self._resolved_mode)
+        rect = QRectF(0.0, 1.0, float(self.width()), float(self.height() - 2))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(pal.bg_input))
+        p.drawRoundedRect(rect, 4.0, 4.0)
+
+        if self._num_layers > 0:
+            fill = QColor(pal.accent)
+            fill.setAlpha(75 if pal.mode == "dark" else 65)
+            p.setBrush(fill)
+            p.drawRoundedRect(rect.adjusted(1.0, 1.0, -1.0, -1.0), 3.0, 3.0)
+
+            if self._cure_layers:
+                uv_col = QColor(pal.uv_accent)
+                p.setBrush(uv_col)
+                w = max(1.0, rect.width() - 4.0)
+                tick_w = max(2.0, min(4.0, w / max(self._num_layers, 1)))
+                for cl in self._cure_layers:
+                    frac = (cl - 0.5) / float(self._num_layers)
+                    x = rect.left() + 2.0 + frac * w - tick_w * 0.5
+                    p.drawRoundedRect(QRectF(x, rect.top() + 1.0, tick_w, rect.height() - 2.0), 1.0, 1.0)
+        p.end()
+
+
 def _make_sidebar_card(title: str) -> Tuple[QFrame, QVBoxLayout, QHBoxLayout]:
     """Create a sleek flat sidebar card with a compact header bar and body layout."""
     card = QFrame()
     card.setObjectName("sidebarCard")
     vbox = QVBoxLayout(card)
-    vbox.setContentsMargins(10, 7, 10, 8)
-    vbox.setSpacing(5)
+    vbox.setContentsMargins(10, 6, 10, 7)
+    vbox.setSpacing(4)
 
     hdr = QHBoxLayout()
     hdr.setContentsMargins(0, 0, 0, 0)
@@ -336,16 +400,16 @@ def _make_sidebar_card(title: str) -> Tuple[QFrame, QVBoxLayout, QHBoxLayout]:
 def build_right_sidebar(view: "PlaterView") -> QWidget:
     """Build the scrollable right-hand sidebar (Presets, Objects, Transform, Summary) and footer."""
     panel = QWidget()
-    panel.setMinimumWidth(315)
-    panel.setMaximumWidth(500)
+    panel.setMinimumWidth(344)
+    panel.setMaximumWidth(460)
     root = QVBoxLayout(panel)
     root.setContentsMargins(4, 0, 0, 0)
-    root.setSpacing(6)
+    root.setSpacing(5)
 
     cards_holder = QWidget()
     cards_v = QVBoxLayout(cards_holder)
-    cards_v.setContentsMargins(0, 0, 4, 0)
-    cards_v.setSpacing(6)
+    cards_v.setContentsMargins(0, 0, 2, 0)
+    cards_v.setSpacing(5)
 
     cards_v.addWidget(_build_presets_card(view))
     cards_v.addWidget(_build_objects_card(view))
@@ -372,6 +436,7 @@ def _build_presets_card(view: "PlaterView") -> QFrame:
 
     view._preset_combos = {}
     view._preset_mod_labels = {}
+    view._preset_row_widgets = {}
 
     for r_idx, cat in enumerate(PRESET_CATEGORIES):
         lbl_wrap = QWidget()
@@ -398,7 +463,9 @@ def _build_presets_card(view: "PlaterView") -> QFrame:
         cb = QComboBox()
         cb.setStyleSheet(COMPACT_COMBO_QSS)
         cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        cb.setMinimumContentsLength(10)
+        cb.setMinimumContentsLength(8)
+        cb.setMinimumWidth(110)
+        cb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         cb.currentIndexChanged.connect(lambda idx, c=cat: view._on_sidebar_preset_changed(c, idx))
 
         btn_edit = QPushButton()
@@ -414,6 +481,7 @@ def _build_presets_card(view: "PlaterView") -> QFrame:
 
         view._preset_combos[cat] = cb
         view._preset_mod_labels[cat] = mod_lbl
+        view._preset_row_widgets[cat] = [lbl_wrap, cb, btn_edit]
 
     grid.setColumnStretch(1, 1)
     p_vbox.addLayout(grid)
@@ -557,7 +625,8 @@ def _build_transform_card(view: "PlaterView") -> QFrame:
     )
     for w in all_spins:
         w.setStyleSheet(COMPACT_SPIN_QSS)
-        w.setMinimumWidth(58)
+        w.setMinimumWidth(52)
+        w.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
 
     for w in all_spins[:6]:
         w.valueChanged.connect(view._on_transform_edited)
@@ -633,7 +702,7 @@ def _build_summary_card(view: "PlaterView") -> QFrame:
         tile = QFrame()
         tile.setObjectName("statTile")
         th = QHBoxLayout(tile)
-        th.setContentsMargins(8, 5, 8, 5)
+        th.setContentsMargins(8, 3, 8, 3)
         th.setSpacing(6)
         lt = QLabel(label_txt)
         lt.setObjectName("statLabel")
@@ -647,6 +716,7 @@ def _build_summary_card(view: "PlaterView") -> QFrame:
 
     t_layers, view.lbl_stat_layers = _make_tile("Layers")
     t_cycles, view.lbl_stat_cycles = _make_tile("UV Cures")
+    view._tile_uv_cycles = t_cycles
     t_time, view.lbl_stat_time = _make_tile("Time")
     t_lines, view.lbl_stat_lines = _make_tile("Lines")
 
@@ -669,7 +739,7 @@ def _build_summary_card(view: "PlaterView") -> QFrame:
         row_box = QFrame()
         row_box.setObjectName("statTile")
         rh = QHBoxLayout(row_box)
-        rh.setContentsMargins(8, 4, 6, 4)
+        rh.setContentsMargins(8, 3, 6, 3)
         rh.setSpacing(5)
 
         lbl = QLabel(label_txt)
@@ -711,8 +781,12 @@ def _build_summary_card(view: "PlaterView") -> QFrame:
         lambda: view.set_resin_unit("ml"),
         lambda: view.set_resin_unit("g"),
     )
+    view._resin_material_row = res_box
     s_vbox.addWidget(fil_box)
     s_vbox.addWidget(res_box)
+
+    view.cure_cadence_strip = CureCadenceStrip()
+    s_vbox.addWidget(view.cure_cadence_strip)
     return card
 
 
@@ -721,12 +795,13 @@ def _build_action_footer(view: "PlaterView") -> QFrame:
     footer = QFrame()
     footer.setObjectName("card")
     f_vbox = QVBoxLayout(footer)
-    f_vbox.setContentsMargins(10, 10, 10, 10)
-    f_vbox.setSpacing(6)
+    f_vbox.setContentsMargins(10, 7, 10, 8)
+    f_vbox.setSpacing(4)
 
     view.progress_bar = QProgressBar()
     view.progress_bar.setRange(0, 100)
     view.progress_bar.setValue(0)
+    view.progress_bar.setFixedHeight(15)
     f_vbox.addWidget(view.progress_bar)
 
     view.lbl_status = QLabel("Ready. Load a model and click Slice Plate.")

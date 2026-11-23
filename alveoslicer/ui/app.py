@@ -103,9 +103,9 @@ def main() -> None:
 
     splash.set_status("Loading 3D viewport & interface...")
     _pump_events(app, ticks=2)
-    from .styling.theme import DARK_STYLESHEET
+    from .styling.theme import build_stylesheet, load_theme_preference
 
-    app.setStyleSheet(DARK_STYLESHEET)
+    app.setStyleSheet(build_stylesheet(load_theme_preference()))
 
     from .main_window import AlveoSlicerWindow
 

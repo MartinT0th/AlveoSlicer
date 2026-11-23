@@ -8,7 +8,7 @@ with ``make_card`` and ``make_page_container`` helpers shared by every settings 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -76,11 +75,19 @@ class CategorySettingsTab(QWidget):
         self._suppress_signals = False
         self._post_change_hooks: List[Callable[[], None]] = []
         self._section_icons: List[Tuple[QListWidgetItem, str]] = []
+        self._section_meta: List[Tuple[QListWidgetItem, bool, bool]] = []
+        self._visibility_widgets: List[QWidget] = []
+        self._advanced_ids: Set[int] = set()
+        self._hybrid_only_ids: Set[int] = set()
+        self._hybrid_only_form_rows: List[Tuple[QFormLayout, QWidget]] = []
+        self._experience_mode: str = "advanced"
+        self._hybrid_enabled: bool = True
+        self._preset_filter: Optional[Callable[[Any], bool]] = None
         self._resolved_theme: str = "dark"
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(10)
+        root.setSpacing(8)
 
         # ---- Top Preset Management Bar ----
         bar = QFrame()
@@ -90,11 +97,12 @@ class CategorySettingsTab(QWidget):
         bar_layout.setSpacing(8)
 
         lbl_title = QLabel(f"{CATEGORY_LABELS[category]} Preset:")
-        lbl_title.setStyleSheet("font-weight: 700;")
+        lbl_title.setObjectName("sectionTitle")
         bar_layout.addWidget(lbl_title)
 
         self.cb_preset = QComboBox()
-        self.cb_preset.setMinimumWidth(290)
+        self.cb_preset.setMinimumWidth(260)
+        self.cb_preset.setMaximumWidth(420)
         self.cb_preset.currentIndexChanged.connect(self._on_preset_combo_changed)
         bar_layout.addWidget(self.cb_preset, stretch=1)
 
@@ -102,6 +110,8 @@ class CategorySettingsTab(QWidget):
         self.lbl_modified.setObjectName("modifiedPill")
         self.lbl_modified.setVisible(False)
         bar_layout.addWidget(self.lbl_modified)
+
+        bar_layout.addStretch(1)
 
         self.btn_save = QPushButton("Save")
         self.btn_save.setToolTip("Overwrite the current custom user preset")
@@ -126,6 +136,13 @@ class CategorySettingsTab(QWidget):
 
         root.addWidget(bar)
 
+        self.lbl_experience_hint = QLabel(
+            "Simple mode — showing essential parameters. Switch to Advanced in the top bar for full calibration."
+        )
+        self.lbl_experience_hint.setObjectName("experienceHint")
+        self.lbl_experience_hint.setVisible(False)
+        root.addWidget(self.lbl_experience_hint)
+
         # ---- Resizable Two-Pane Body ----
         body_split = QSplitter(Qt.Orientation.Horizontal)
         body_split.setChildrenCollapsible(False)
@@ -133,8 +150,9 @@ class CategorySettingsTab(QWidget):
         self.sidebar = QListWidget()
         self.sidebar.setObjectName("categoryList")
         self.sidebar.setIconSize(QSize(16, 16))
-        self.sidebar.setMinimumWidth(190)
-        self.sidebar.setMaximumWidth(280)
+        self.sidebar.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.sidebar.setMinimumWidth(214)
+        self.sidebar.setMaximumWidth(270)
         self.sidebar.currentRowChanged.connect(self._on_section_changed)
         body_split.addWidget(self.sidebar)
 
@@ -142,7 +160,7 @@ class CategorySettingsTab(QWidget):
         body_split.addWidget(self.pages)
         body_split.setStretchFactor(0, 0)
         body_split.setStretchFactor(1, 1)
-        body_split.setSizes([224, 960])
+        body_split.setSizes([230, 960])
 
         root.addWidget(body_split, stretch=1)
 
@@ -168,15 +186,102 @@ class CategorySettingsTab(QWidget):
     # Page & Typed Field Binding API
     # ------------------------------------------------------------------
 
-    def add_section(self, title: str, content_widget: QWidget, icon_name: str = "settings") -> None:
+    def add_section(
+        self,
+        title: str,
+        content_widget: QWidget,
+        icon_name: str = "settings",
+        advanced: bool = False,
+        hybrid_only: bool = False,
+    ) -> None:
         """Append a sidebar entry and scrollable page to this settings tab."""
         pal = get_palette(self._resolved_theme)
         item = QListWidgetItem(make_icon(icon_name, pal.icon_fg, pal.icon_accent, 16), title)
         self.sidebar.addItem(item)
         self._section_icons.append((item, icon_name))
+        self._section_meta.append((item, advanced, hybrid_only))
         self.pages.addWidget(wrap_scroll(content_widget))
         if self.sidebar.count() == 1:
             self.sidebar.setCurrentRow(0)
+
+    def _track_visibility_widget(self, w: QWidget) -> None:
+        if w not in self._visibility_widgets:
+            self._visibility_widgets.append(w)
+
+    def mark_advanced(self, *widgets: QWidget) -> None:
+        """Register cards or controls that are hidden in Simple mode."""
+        for w in widgets:
+            self._track_visibility_widget(w)
+            self._advanced_ids.add(id(w))
+
+    def mark_hybrid_only(self, *widgets: QWidget) -> None:
+        """Register cards or controls that are hidden when an FFF-only printer is selected."""
+        for w in widgets:
+            self._track_visibility_widget(w)
+            self._hybrid_only_ids.add(id(w))
+
+    def mark_hybrid_form_rows(self, form: QFormLayout, *field_widgets: QWidget) -> None:
+        """Register individual ``QFormLayout`` rows to hide when FFF-only mode is active."""
+        for w in field_widgets:
+            self._hybrid_only_form_rows.append((form, w))
+
+    @property
+    def hybrid_enabled(self) -> bool:
+        """Whether the active printer supports hybrid resin/UV features."""
+        return self._hybrid_enabled
+
+    def set_experience_mode(self, mode: str) -> None:
+        """Toggle visibility of advanced sections and cards without altering field bindings."""
+        self._experience_mode = "simple" if str(mode).lower() == "simple" else "advanced"
+        self._apply_visibility_filters()
+
+    def set_hybrid_enabled(self, enabled: bool) -> None:
+        """Show or hide hybrid resin/UV sections and cards without altering field bindings."""
+        self._hybrid_enabled = bool(enabled)
+        self._apply_visibility_filters()
+        for hook in self._post_change_hooks:
+            hook()
+
+    def _apply_visibility_filters(self) -> None:
+        is_adv = self._experience_mode == "advanced"
+        is_hyb = self._hybrid_enabled
+
+        has_hidden_adv = False
+        first_visible_row = -1
+        for idx, (item, sec_adv, sec_hyb) in enumerate(self._section_meta):
+            hide = (sec_adv and not is_adv) or (sec_hyb and not is_hyb)
+            item.setHidden(hide)
+            if sec_adv and not is_adv and not (sec_hyb and not is_hyb):
+                has_hidden_adv = True
+            elif not hide and first_visible_row < 0:
+                first_visible_row = idx
+
+        for w in self._visibility_widgets:
+            wid = id(w)
+            hide_adv = (wid in self._advanced_ids) and (not is_adv)
+            hide_hyb = (wid in self._hybrid_only_ids) and (not is_hyb)
+            w.setVisible(not (hide_adv or hide_hyb))
+            if hide_adv and not hide_hyb:
+                has_hidden_adv = True
+
+        for form, field_w in self._hybrid_only_form_rows:
+            if hasattr(form, "setRowVisible"):
+                form.setRowVisible(field_w, is_hyb)
+            else:
+                lbl = form.labelForField(field_w)
+                if lbl is not None:
+                    lbl.setVisible(is_hyb)
+                field_w.setVisible(is_hyb)
+
+        self.lbl_experience_hint.setVisible((not is_adv) and has_hidden_adv)
+
+        cur_row = self.sidebar.currentRow()
+        if (
+            0 <= cur_row < len(self._section_meta)
+            and self._section_meta[cur_row][0].isHidden()
+            and first_visible_row >= 0
+        ):
+            self.sidebar.setCurrentRow(first_visible_row)
 
     def add_post_change_hook(self, fn: Callable[[], None]) -> None:
         """Register a callback invoked whenever bound values load or change."""
@@ -195,6 +300,7 @@ class CategorySettingsTab(QWidget):
     ) -> QDoubleSpinBox:
         """Create and bind a ``QDoubleSpinBox`` to config dot-path ``key``."""
         sb = make_double_spin(val, lo, hi, step, decimals, suffix)
+        sb.setFixedWidth(156)
         if tooltip:
             sb.setToolTip(tooltip)
         sb.valueChanged.connect(self._on_any_widget_changed)
@@ -213,6 +319,7 @@ class CategorySettingsTab(QWidget):
     ) -> QSpinBox:
         """Create and bind an integer ``QSpinBox`` to config dot-path ``key``."""
         sb = make_spin(val, lo, hi, step, suffix)
+        sb.setFixedWidth(156)
         if tooltip:
             sb.setToolTip(tooltip)
         sb.valueChanged.connect(self._on_any_widget_changed)
@@ -222,6 +329,8 @@ class CategorySettingsTab(QWidget):
     def bind_combo(self, key: str, items: List[str], current: str, tooltip: str = "") -> QComboBox:
         """Create and bind a ``QComboBox`` to config dot-path ``key``."""
         cb = QComboBox()
+        cb.setMinimumWidth(210)
+        cb.setMaximumWidth(280)
         cb.addItems(items)
         cb.setCurrentText(current)
         if tooltip:
@@ -232,9 +341,41 @@ class CategorySettingsTab(QWidget):
         )
         return cb
 
+    def bind_combo_mapped(
+        self,
+        key: str,
+        items: Sequence[Tuple[str, str]],
+        current: str,
+        tooltip: str = "",
+    ) -> QComboBox:
+        """Create and bind a ``QComboBox`` showing human labels while storing raw enum values."""
+        cb = QComboBox()
+        cb.setMinimumWidth(220)
+        cb.setMaximumWidth(320)
+        for val, label in items:
+            cb.addItem(label, userData=val)
+        cur_idx = cb.findData(str(current))
+        if cur_idx >= 0:
+            cb.setCurrentIndex(cur_idx)
+        if tooltip:
+            cb.setToolTip(tooltip)
+        cb.currentIndexChanged.connect(self._on_any_widget_changed)
+
+        def _set_val(v: Any, w: QComboBox = cb) -> None:
+            idx = w.findData(str(v))
+            if idx >= 0:
+                w.setCurrentIndex(idx)
+
+        self._bindings[key] = _FieldBinding(
+            key, cb, lambda w=cb: str(w.currentData() if w.currentData() is not None else w.currentText()), _set_val
+        )
+        return cb
+
     def bind_line_edit(self, key: str, val: str, fallback: str = "", tooltip: str = "") -> QLineEdit:
         """Create and bind a single-line ``QLineEdit`` with empty-string fallback."""
         ed = QLineEdit(val)
+        ed.setMinimumWidth(190)
+        ed.setMaximumWidth(260)
         if tooltip:
             ed.setToolTip(tooltip)
         ed.textChanged.connect(self._on_any_widget_changed)
@@ -250,6 +391,8 @@ class CategorySettingsTab(QWidget):
         ed = QPlainTextEdit(val)
         ed.setPlaceholderText(placeholder)
         ed.setFixedHeight(height)
+        ed.setMinimumWidth(380)
+        ed.setMaximumWidth(580)
         if tooltip:
             ed.setToolTip(tooltip)
         ed.textChanged.connect(self._on_any_widget_changed)
@@ -288,6 +431,7 @@ class CategorySettingsTab(QWidget):
         """Create and bind a checkbox-gated ``Optional[float]`` spinbox."""
         chk = QCheckBox(check_label)
         sb = make_double_spin(default_val, lo, hi, step, decimals, suffix)
+        sb.setFixedWidth(156)
         sb.setEnabled(False)
 
         def _sync() -> None:
@@ -353,12 +497,25 @@ class CategorySettingsTab(QWidget):
         """Apply all current widget values back into ``cfg``."""
         apply_category_values(cfg, self.category, self.current_values())
 
+    def set_preset_filter(
+        self,
+        predicate: Optional[Callable[[Any], bool]],
+        select_name: Optional[str] = None,
+    ) -> None:
+        """Filter presets shown in the category dropdown without deleting hidden presets."""
+        self._preset_filter = predicate
+        self.refresh_preset_list(select_name=select_name or self._active_preset_name)
+
     def refresh_preset_list(self, select_name: Optional[str] = None) -> None:
         """Rebuild the preset combo box from ``PresetManager`` while preserving selection."""
         target = select_name or self._active_preset_name
         self.cb_preset.blockSignals(True)
         self.cb_preset.clear()
-        presets = self.preset_manager.list_presets(self.category)
+        all_presets = self.preset_manager.list_presets(self.category)
+        if self._preset_filter is not None:
+            presets = [p for p in all_presets if self._preset_filter(p)] or all_presets
+        else:
+            presets = all_presets
         selected_idx = 0
         for idx, p in enumerate(presets):
             self.cb_preset.addItem(p.name if p.builtin else f"{p.name}  (User)", userData=p.name)
@@ -477,23 +634,48 @@ class CategorySettingsTab(QWidget):
             self.preset_selected.emit(self.category, fallback)
 
 
-def make_card(title: str) -> Tuple[QGroupBox, QFormLayout]:
-    """Create a titled ``QGroupBox`` card with a right-aligned ``QFormLayout``."""
-    box = QGroupBox(title)
-    form = QFormLayout(box)
+def make_card(title: str) -> Tuple[QFrame, QFormLayout]:
+    """Create a flat titled settings card with a hairline header and capped-width form layout."""
+    card = QFrame()
+    card.setObjectName("settingsCard")
+    outer = QVBoxLayout(card)
+    outer.setContentsMargins(16, 12, 16, 14)
+    outer.setSpacing(10)
+
+    hdr = QLabel(title.replace("&&", "&"))
+    hdr.setObjectName("settingsCardHeader")
+    outer.addWidget(hdr)
+
+    div = QFrame()
+    div.setObjectName("settingsDivider")
+    outer.addWidget(div)
+
+    form = QFormLayout()
+    form.setContentsMargins(0, 2, 0, 0)
     form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    form.setHorizontalSpacing(14)
-    form.setVerticalSpacing(8)
-    return box, form
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    form.setHorizontalSpacing(16)
+    form.setVerticalSpacing(9)
+    outer.addLayout(form)
+    return card, form
 
 
 def make_page_container(widgets: List[QWidget]) -> QWidget:
-    """Stack ``widgets`` vertically inside a padded settings page with trailing stretch."""
-    w = QWidget()
-    vbox = QVBoxLayout(w)
-    vbox.setContentsMargins(6, 4, 10, 12)
-    vbox.setSpacing(10)
+    """Stack ``widgets`` vertically in a balanced max-width settings column."""
+    outer = QWidget()
+    outer_row = QHBoxLayout(outer)
+    outer_row.setContentsMargins(6, 2, 12, 14)
+    outer_row.setSpacing(0)
+
+    col = QWidget()
+    col.setMaximumWidth(820)
+    vbox = QVBoxLayout(col)
+    vbox.setContentsMargins(0, 0, 0, 0)
+    vbox.setSpacing(12)
     for child in widgets:
         vbox.addWidget(child)
     vbox.addStretch(1)
-    return w
+
+    outer_row.addWidget(col, stretch=1)
+    outer_row.addStretch(0)
+    return outer

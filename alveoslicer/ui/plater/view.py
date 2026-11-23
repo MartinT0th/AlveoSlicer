@@ -8,7 +8,7 @@ vertical layer slider (:class:`LayerRangeBar`), move scrubber, and right sidebar
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -123,7 +123,11 @@ class PlaterView(QWidget):
         self._paint_mode_btns: Dict[int, QPushButton] = {}
         self._preset_combos: Dict[str, QComboBox] = {}
         self._preset_mod_labels: Dict[str, QLabel] = {}
+        self._preset_row_widgets: Dict[str, List[QWidget]] = {}
+        self._preset_filters: Dict[str, Optional[Callable[[Any], bool]]] = {}
+        self._legend_row_widgets: Dict[str, List[QWidget]] = {}
         self._feature_checks: Dict[int, QCheckBox] = {}
+        self._is_hybrid: bool = True
 
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(40)
@@ -139,7 +143,7 @@ class PlaterView(QWidget):
         self.splitter.addWidget(build_right_sidebar(self))
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
-        self.splitter.setSizes([1120, 360])
+        self.splitter.setSizes([1060, 356])
         root.addWidget(self.splitter)
 
         self._build_viewport_overlays()
@@ -211,10 +215,13 @@ class PlaterView(QWidget):
             btn.setIcon(make_icon(icon_name, color=fg, accent=ac, size=size))
 
     def apply_theme(self, resolved_mode: str) -> None:
-        """Apply dark or light styling across the 3D viewport, layer bar, icons, and dividers."""
+        """Apply dark or light styling across the 3D viewport, layer bar, 2D inspector, icons, and dividers."""
         self._resolved_theme = resolved_mode
         self.viewport.set_theme_mode(resolved_mode)
         self.layer_bar.apply_theme(resolved_mode)
+        self.cure_cadence_strip.set_theme(resolved_mode)
+        if hasattr(self.inspector_2d, "apply_theme"):
+            self.inspector_2d.apply_theme(resolved_mode)
         self._refresh_all_icons()
 
         pal = get_palette(resolved_mode)
@@ -468,6 +475,15 @@ class PlaterView(QWidget):
         self.preview_controls.setVisible(False)
         b_row.addWidget(self.preview_controls, stretch=1)
 
+        self.basins_controls = QWidget()
+        bs_row = QHBoxLayout(self.basins_controls)
+        bs_row.setContentsMargins(8, 0, 0, 0)
+        lbl_bs_hint = QLabel("Use toolbar to pan, zoom, or export 2D cross-section snapshots.")
+        lbl_bs_hint.setObjectName("mutedLabel")
+        bs_row.addWidget(lbl_bs_hint, stretch=1)
+        self.basins_controls.setVisible(False)
+        b_row.addWidget(self.basins_controls, stretch=1)
+
         vbox.addWidget(bottom)
         return container
 
@@ -670,13 +686,22 @@ class PlaterView(QWidget):
         finally:
             self._suppress_transform = False
 
+    def set_preset_filter(self, category: str, predicate: Optional[Callable[[Any], bool]]) -> None:
+        """Register an optional predicate filtering presets shown in a Plater sidebar dropdown."""
+        self._preset_filters[category] = predicate
+
     def refresh_preset_dropdown(self, category: str, selected_name: str, is_modified: bool) -> None:
         """Repopulate one sidebar preset combo box and update its modified badge."""
         cb = self._preset_combos[category]
         self._suppress_presets = True
         try:
             cb.clear()
-            presets = self.preset_manager.list_presets(category)
+            all_presets = self.preset_manager.list_presets(category)
+            pred = self._preset_filters.get(category)
+            if pred is not None:
+                presets = [p for p in all_presets if pred(p)] or all_presets
+            else:
+                presets = all_presets
             sel_idx = 0
             for idx, p in enumerate(presets):
                 cb.addItem(p.name if p.builtin else f"{p.name} (User)", userData=p.name)
@@ -689,13 +714,30 @@ class PlaterView(QWidget):
             self._suppress_presets = False
         self._preset_mod_labels[category].setVisible(is_modified)
 
+    def set_hybrid_mode(self, is_hybrid: bool) -> None:
+        """Show or hide resin/UV UI controls on Plater when switching Hybrid vs FFF-only printers."""
+        hyb = bool(is_hybrid)
+        self._is_hybrid = hyb
+        for w in self._preset_row_widgets.get("resin", []):
+            w.setVisible(hyb)
+        self._tile_uv_cycles.setVisible(hyb)
+        self._resin_material_row.setVisible(hyb)
+        self.cure_cadence_strip.setVisible(hyb)
+        self.btn_mode_basins.setVisible(hyb)
+        self.chk_wireframe.setVisible(hyb)
+        for tag in ("Filled resin", "Resin dosing"):
+            for w in self._legend_row_widgets.get(tag, []):
+                w.setVisible(hyb)
+        if not hyb and self._current_view == "basins":
+            self.set_view_mode("preview" if self.btn_mode_preview.isEnabled() else "editor")
+
     def set_preset_modified(self, category: str, is_modified: bool) -> None:
         """Show or hide the modified indicator dot next to a sidebar preset dropdown."""
         self._preset_mod_labels[category].setVisible(is_modified)
 
     def update_mode_badge(self, cfg: SlicerConfig) -> None:
         """Update the Hybrid vs. Standard FFF pill badge in the Slice Summary card."""
-        pump, uv = cfg.hybrid.enable_resin_pumping, cfg.hybrid.enable_uv_curing
+        pump, uv = cfg.effective_resin_pumping, cfg.effective_uv_curing
         if pump and uv:
             text, tip, obj = "HYBRID", "Hybrid Mode: FFF + Photopolymer Resin + UV Curing", "modeBannerHybrid"
         elif pump:
@@ -784,11 +826,16 @@ class PlaterView(QWidget):
             self._refresh_material_summary()
             self.lbl_stat_time.setText(format_duration(res.est_print_time_s))
             self.lbl_stat_lines.setText(f"{res.gcode_line_count:,}")
+            self.cure_cadence_strip.set_schedule(
+                len(res.layers),
+                [ev.end_layer for ev in res.schedule if ev is not None and hasattr(ev, "end_layer")],
+            )
             self.btn_export.setEnabled(True)
         else:
             self.btn_mode_basins.setEnabled(False)
             self._last_filament_mm = None
             self._last_resin_ml = None
+            self.cure_cadence_strip.set_schedule(0, ())
             for lbl in (
                 self.lbl_stat_layers, self.lbl_stat_cycles, self.lbl_stat_filament,
                 self.lbl_stat_resin, self.lbl_stat_time, self.lbl_stat_lines,
@@ -804,6 +851,7 @@ class PlaterView(QWidget):
             if res is None:
                 self.lbl_stat_layers.setText(str(preview.num_layers))
                 self.lbl_stat_cycles.setText(str(len(preview.cure_layers)))
+                self.cure_cadence_strip.set_schedule(preview.num_layers, preview.cure_layers)
                 self._last_filament_mm = float(preview.total_filament_mm)
                 self._last_resin_ml = float(preview.total_resin_ml)
                 self._refresh_material_summary()
@@ -836,6 +884,7 @@ class PlaterView(QWidget):
             self.view_stack.setCurrentIndex(1)
             self.editor_controls.setVisible(False)
             self.preview_controls.setVisible(False)
+            self.basins_controls.setVisible(True)
         else:
             self.view_stack.setCurrentIndex(0)
             self.viewport.set_mode(mode)
@@ -844,6 +893,7 @@ class PlaterView(QWidget):
             self.layer_bar.setVisible(is_prev)
             self.editor_controls.setVisible(not is_prev)
             self.preview_controls.setVisible(is_prev)
+            self.basins_controls.setVisible(False)
 
             self._vp_tool_rail.setVisible(not is_prev)
             for w in self._top_edit_widgets:

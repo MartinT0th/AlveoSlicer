@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
-import shapely
 from shapely.geometry import Polygon
 
 
@@ -56,14 +55,16 @@ class NormalVoronoiLattice(list):
         seed_z_bounds: np.ndarray,
         pattern: str = "hexagonal",
         pitch: float = 10.0,
+        generator: str = "voxel_sdf",
     ) -> None:
-        """Store 3D wireframe capsules alongside exact half-plane cell definitions."""
+        """Store 3D wireframe capsules alongside exact half-plane or 2.5D cell definitions."""
         super().__init__(capsules)
         self.seeds = seeds
         self.cell_planes = cell_planes
         self.seed_z_bounds = seed_z_bounds
         self.pattern = pattern
         self.pitch = pitch
+        self.generator = generator
 
 
 def combine_lattices(
@@ -106,6 +107,7 @@ def combine_lattices(
         seed_z_bounds=z_bounds,
         pattern=lattices[0].pattern,
         pitch=lattices[0].pitch,
+        generator=lattices[0].generator,
     )
 
 
@@ -155,6 +157,4 @@ def clip_voronoi_cell_2d(
     p_geom = Polygon(poly)
     if p_geom.is_empty or p_geom.area < 1e-4:
         return None
-    if not p_geom.is_valid:
-        p_geom = shapely.make_valid(p_geom)
     return p_geom

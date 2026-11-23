@@ -134,28 +134,125 @@ def create_test_curved_wall_mesh(cfg: SlicerConfig) -> trimesh.Trimesh:
 # -----------------------------------------------------------------------------
 
 
+def _voxelize_mesh_fast(mesh: trimesh.Trimesh, pitch: float) -> tuple[np.ndarray, np.ndarray]:
+    """Exact scanline Z-slice voxelizer for watertight meshes (orders of magnitude faster than subdivide)."""
+    bmin = np.asarray(mesh.bounds[0], dtype=np.float64)
+    bmax = np.asarray(mesh.bounds[1], dtype=np.float64)
+    shape = np.maximum(1, np.ceil((bmax - bmin) / pitch).astype(int) + 1)
+    nx, ny, nz = int(shape[0]), int(shape[1]), int(shape[2])
+    vol = np.zeros((nx, ny, nz), dtype=bool)
+    tris = np.asarray(mesh.triangles, dtype=np.float64)
+    if len(tris) == 0:
+        return vol, bmin
+
+    tzmin = tris[:, :, 2].min(axis=1)
+    tzmax = tris[:, :, 2].max(axis=1)
+    ys = bmin[1] + np.arange(ny, dtype=np.float64) * pitch
+    zs = bmin[2] + np.arange(nz, dtype=np.float64) * pitch
+    x0 = float(bmin[0])
+    inv_p = 1.0 / pitch
+
+    for k in range(nz):
+        z = zs[k] + 1.13e-7
+        hit = (tzmin < z) & (tzmax > z)
+        if not np.any(hit):
+            continue
+        t = tris[hit]
+        above = t[:, :, 2] > z
+        na = above.sum(axis=1)
+        valid = (na == 1) | (na == 2)
+        if not np.any(valid):
+            continue
+        t, above, na = t[valid], above[valid], na[valid]
+        lone = np.where(na[:, None] == 1, above, ~above)
+        i0 = np.argmax(lone, axis=1)
+        rows = np.arange(len(t))
+        p0, p1, p2 = t[rows, i0], t[rows, (i0 + 1) % 3], t[rows, (i0 + 2) % 3]
+        t1 = (z - p0[:, 2]) / (p1[:, 2] - p0[:, 2])
+        t2 = (z - p0[:, 2]) / (p2[:, 2] - p0[:, 2])
+        x1 = p0[:, 0] + t1 * (p1[:, 0] - p0[:, 0])
+        y1 = p0[:, 1] + t1 * (p1[:, 1] - p0[:, 1])
+        x2 = p0[:, 0] + t2 * (p2[:, 0] - p0[:, 0])
+        y2 = p0[:, 1] + t2 * (p2[:, 1] - p0[:, 1])
+
+        j0 = max(0, int(np.searchsorted(ys, float(min(y1.min(), y2.min())), side="left")))
+        j1 = min(ny, int(np.searchsorted(ys, float(max(y1.max(), y2.max())), side="right")))
+        for j in range(j0, j1):
+            yj = ys[j] + 1.37e-7
+            cross = (y1 > yj) != (y2 > yj)
+            if not np.any(cross):
+                continue
+            xc = x1[cross] + (yj - y1[cross]) * (x2[cross] - x1[cross]) / (y2[cross] - y1[cross])
+            xc.sort()
+            i_lo = np.ceil((xc[0::2] - x0) * inv_p).astype(int)
+            i_hi = np.floor((xc[1::2] - x0) * inv_p).astype(int) + 1
+            for a, b in zip(i_lo, i_hi):
+                if b > 0 and a < nx:
+                    vol[max(0, int(a)) : min(nx, int(b)), j, k] = True
+    return vol, bmin
+
+
 class VolumetricField:
-    """Lightweight 3D voxel occupancy + signed distance field (SDF) for 3D cellular seeding."""
+    """Lightweight 3D voxel occupancy + lazy signed distance field (SDF) for 3D cellular seeding."""
 
     def __init__(self, mesh: trimesh.Trimesh, pitch: float):
-        """Voxelize ``mesh`` at ``pitch`` mm and compute interior/exterior Euclidean distance fields."""
+        """Voxelize ``mesh`` at ``pitch`` mm; distance fields are computed lazily on first access."""
         self.mesh = mesh
         self.pitch = float(pitch)
-        vox = mesh.voxelized(pitch=self.pitch).fill()
-        vol = np.pad(vox.matrix.astype(bool), pad_width=2, mode="constant", constant_values=False)
+        raw_vol, raw_origin = _voxelize_mesh_fast(mesh, self.pitch)
+        if not np.any(raw_vol):
+            vox = mesh.voxelized(pitch=self.pitch).fill()
+            raw_vol = vox.matrix.astype(bool)
+            raw_origin = np.asarray(vox.translation, dtype=np.float64)
+        vol = np.pad(raw_vol, pad_width=2, mode="constant", constant_values=False)
         self.vol: np.ndarray = vol
         self.occ: np.ndarray = vol
-        self.origin: np.ndarray = vox.translation - 2.0 * self.pitch
+        self.origin: np.ndarray = raw_origin - 2.0 * self.pitch
         self.shape = vol.shape
-        self.dist_in: np.ndarray = ndimage.distance_transform_edt(vol) * self.pitch
-        self.dist_out: np.ndarray = ndimage.distance_transform_edt(~vol) * self.pitch
-        self.sdf: np.ndarray = self.dist_out - self.dist_in
-        self.edt_in: np.ndarray = self.dist_in
+        self._dist_in: np.ndarray | None = None
+        self._dist_out: np.ndarray | None = None
+        self._sdf: np.ndarray | None = None
+
+    @property
+    def dist_in(self) -> np.ndarray:
+        """Interior Euclidean distance transform (mm), computed lazily."""
+        if self._dist_in is None:
+            self._dist_in = ndimage.distance_transform_edt(self.vol) * self.pitch
+        return self._dist_in
+
+    @property
+    def edt_in(self) -> np.ndarray:
+        """Alias for :attr:`dist_in`."""
+        return self.dist_in
+
+    @property
+    def dist_out(self) -> np.ndarray:
+        """Exterior Euclidean distance transform (mm), computed lazily."""
+        if self._dist_out is None:
+            self._dist_out = ndimage.distance_transform_edt(~self.vol) * self.pitch
+        return self._dist_out
+
+    @property
+    def sdf(self) -> np.ndarray:
+        """Signed distance field (positive outside, negative inside), computed lazily."""
+        if self._sdf is None:
+            self._sdf = self.dist_out - self.dist_in
+        return self._sdf
 
 
 # -----------------------------------------------------------------------------
 # Topology-Safe 2D Shapely Geometry Helpers
 # -----------------------------------------------------------------------------
+
+
+def _unwrap_collection(geom: shapely.Geometry) -> shapely.Geometry:
+    """Fast-path cleanup for fresh GEOS outputs: strip non-polygonal members without re-running is_valid."""
+    if geom is None or geom.is_empty:
+        return Polygon()
+    if geom.geom_type == "GeometryCollection":
+        polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon") and not g.is_empty]
+        return shapely.unary_union(polys) if polys else Polygon()
+    return geom
 
 
 def clean_geom(geom: shapely.Geometry) -> shapely.Geometry:
@@ -170,12 +267,7 @@ def clean_geom(geom: shapely.Geometry) -> shapely.Geometry:
             geom = geom.buffer(0)
         except Exception:
             return Polygon()
-    if geom.is_empty:
-        return Polygon()
-    if geom.geom_type == "GeometryCollection":
-        polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon") and not g.is_empty]
-        return shapely.unary_union(polys) if polys else Polygon()
-    return geom
+    return _unwrap_collection(geom)
 
 
 def safe_buffer(geom: shapely.Geometry, dist: float, **kwargs) -> shapely.Geometry:
@@ -183,16 +275,20 @@ def safe_buffer(geom: shapely.Geometry, dist: float, **kwargs) -> shapely.Geomet
     if geom is None or geom.is_empty:
         return Polygon()
     try:
-        return clean_geom(geom.buffer(dist, **kwargs))
+        # GEOS buffer() always returns a valid Polygon/MultiPolygon when it succeeds
+        res = geom.buffer(dist, **kwargs)
+        return Polygon() if res.is_empty else res
     except Exception:
         c = clean_geom(geom)
         if c.is_empty:
             return Polygon()
         try:
-            return clean_geom(c.buffer(dist, **kwargs))
+            res = c.buffer(dist, **kwargs)
+            return Polygon() if res.is_empty else res
         except Exception:
             try:
-                return clean_geom(shapely.set_precision(c, 1e-4).buffer(dist, **kwargs))
+                res = shapely.set_precision(c, 1e-4).buffer(dist, **kwargs)
+                return Polygon() if res.is_empty else res
             except Exception:
                 return Polygon()
 
@@ -205,17 +301,17 @@ def safe_union(geoms: Sequence[shapely.Geometry]) -> shapely.Geometry:
     if len(valid) == 1:
         return clean_geom(valid[0])
     try:
-        return clean_geom(shapely.unary_union(valid))
+        return _unwrap_collection(shapely.unary_union(valid))
     except Exception:
         cleaned = [clean_geom(g) for g in valid]
         cleaned = [g for g in cleaned if not g.is_empty]
         if not cleaned:
             return Polygon()
         try:
-            return clean_geom(shapely.unary_union(cleaned))
+            return _unwrap_collection(shapely.unary_union(cleaned))
         except Exception:
             try:
-                return clean_geom(shapely.unary_union([shapely.set_precision(g, 1e-4) for g in cleaned]))
+                return _unwrap_collection(shapely.unary_union([shapely.set_precision(g, 1e-4) for g in cleaned]))
             except Exception:
                 acc = cleaned[0]
                 for g in cleaned[1:]:
@@ -234,7 +330,7 @@ def _safe_binary_op(
 ) -> shapely.Geometry:
     """Execute a binary Shapely op with clean_geom and 1e-4 precision-grid fallbacks."""
     try:
-        return clean_geom(op(a, b))
+        return _unwrap_collection(op(a, b))
     except Exception:
         ca, cb = clean_geom(a), clean_geom(b)
         if ca.is_empty:
@@ -242,10 +338,10 @@ def _safe_binary_op(
         if cb.is_empty:
             return fallback_on_fail(ca)
         try:
-            return clean_geom(op(ca, cb))
+            return _unwrap_collection(op(ca, cb))
         except Exception:
             try:
-                return clean_geom(op(shapely.set_precision(ca, 1e-4), shapely.set_precision(cb, 1e-4)))
+                return _unwrap_collection(op(shapely.set_precision(ca, 1e-4), shapely.set_precision(cb, 1e-4)))
             except Exception:
                 return fallback_on_fail(ca)
 
@@ -304,9 +400,18 @@ def iter_polygons(geom: shapely.Geometry, min_area: float = 1e-5) -> List[Polygo
 
 def rasterize_geom(geom: shapely.Geometry, gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
     """Rasterize a 2D Shapely geometry onto an (nx, ny) boolean grid (for DP/BFS/UI only)."""
-    if geom is None or geom.is_empty:
-        return np.zeros(gx.shape, dtype=bool)
-    return shapely.contains_xy(geom, gx, gy)
+    out = np.zeros(gx.shape, dtype=bool)
+    if geom is None or geom.is_empty or gx.size == 0:
+        return out
+    x0, y0, x1, y1 = geom.bounds
+    nx, ny = gx.shape
+    ix0 = max(0, int(np.searchsorted(gx[:, 0], x0, side="left")))
+    ix1 = min(nx, int(np.searchsorted(gx[:, 0], x1, side="right")))
+    iy0 = max(0, int(np.searchsorted(gy[0, :], y0, side="left")))
+    iy1 = min(ny, int(np.searchsorted(gy[0, :], y1, side="right")))
+    if ix0 < ix1 and iy0 < iy1:
+        out[ix0:ix1, iy0:iy1] = shapely.contains_xy(geom, gx[ix0:ix1, iy0:iy1], gy[ix0:ix1, iy0:iy1])
+    return out
 
 
 def disk_kernel(radius_px: int) -> np.ndarray:

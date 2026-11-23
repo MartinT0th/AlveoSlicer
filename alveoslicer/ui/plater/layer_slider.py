@@ -1,9 +1,9 @@
-"""PrusaSlicer-style vertical dual-handle layer range bar with UV cure-cycle markers.
+"""Vertical dual-handle layer range bar with optical UV cure-cycle markers.
 
 Provides :class:`LayerRangeBar`, a compact vertical control docked alongside the
 3D G-code preview viewport. It features a dual-handle track (``min`` and ``max``
-layers), cyan cure-cycle tick indicators, a fixed-height non-jittering UV CURE
-badge, single-layer ``+`` / ``-`` steppers, and a ``Next Cure`` quick-jump button.
+layers), ultraviolet-indigo cure-cycle tick indicators, a fixed-height non-jittering
+UV CURE badge, single-layer ``+`` / ``-`` steppers, and a ``Next Cure`` quick-jump button.
 """
 
 from __future__ import annotations
@@ -21,16 +21,18 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..styling.theme import get_palette
+
 
 class _DualVerticalTrack(QWidget):
-    """Custom-painted vertical range track with upper/lower handles and cyan cure ticks."""
+    """Custom-painted vertical range track with upper/lower handles and UV cure ticks."""
 
     range_changed = Signal(int, int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         """Initialize track geometry, range bounds, and default theme state."""
         super().__init__(parent)
-        self.setMinimumWidth(40)
+        self.setMinimumWidth(42)
         self.setMinimumHeight(180)
         self._min_val = 1
         self._max_val = 1
@@ -38,12 +40,12 @@ class _DualVerticalTrack(QWidget):
         self._high = 1
         self._cure_layers: List[int] = []
         self._dragging: Optional[str] = None
-        self._is_light = False
+        self._resolved_mode = "dark"
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_light_mode(self, is_light: bool) -> None:
         """Switch groove, handle, and cure tick colors between dark and light palettes."""
-        self._is_light = is_light
+        self._resolved_mode = "light" if is_light else "dark"
         self.update()
 
     def configure(self, num_layers: int, cure_layers: Sequence[int]) -> None:
@@ -95,50 +97,52 @@ class _DualVerticalTrack(QWidget):
         return max(self._min_val, min(self._max_val, val))
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
-        """Paint track groove, active yellow span, cyan UV cure ticks, and both handles."""
+        """Paint track groove, active glacial-teal span, indigo UV ticks, and both handles."""
         del event
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        pal = get_palette(self._resolved_mode)
         cx = self.width() * 0.5
         pad = 14.0
-        track_w = 6.0
+        track_w = 5.0
         track_rect = QRectF(cx - track_w * 0.5, pad, track_w, max(1.0, self.height() - 2.0 * pad))
 
-        groove_col = QColor("#cfd6e2") if self._is_light else QColor("#2c303c")
-        accent_col = QColor("#eab308") if self._is_light else QColor("#f5c518")
-        cure_col = QColor("#0284c7") if self._is_light else QColor("#00d4ff")
-        rim_col = QColor("#475569") if self._is_light else QColor("#141518")
-        lo_col = QColor("#64748b") if self._is_light else QColor("#9aa2b1")
+        groove_col = QColor(pal.border_strong)
+        accent_col = QColor(pal.accent)
+        cure_col = QColor(pal.uv_accent)
+        rim_col = QColor(pal.bg_bar if pal.mode == "dark" else "#334155")
+        lo_col = QColor(pal.text_muted)
 
         # Background groove
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(groove_col)
-        p.drawRoundedRect(track_rect, 3.0, 3.0)
+        p.drawRoundedRect(track_rect, 2.5, 2.5)
 
-        # Active yellow range span
+        # Active glacial-teal range span
         y_hi = self._val_to_y(self._high)
         y_lo = self._val_to_y(self._low)
         active_rect = QRectF(cx - track_w * 0.5, y_hi, track_w, max(2.0, y_lo - y_hi))
         p.setBrush(accent_col)
-        p.drawRoundedRect(active_rect, 3.0, 3.0)
+        p.drawRoundedRect(active_rect, 2.5, 2.5)
 
-        # Cyan side ticks marking every UV cure cycle layer
-        p.setPen(QPen(cure_col, 1.6))
+        # Ultraviolet-indigo side ticks marking every UV cure cycle layer
+        p.setPen(QPen(cure_col, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         for cl in self._cure_layers:
             yc = self._val_to_y(cl)
-            p.drawLine(int(cx - 11), int(yc), int(cx - 5), int(yc))
-            p.drawLine(int(cx + 5), int(yc), int(cx + 11), int(yc))
+            p.drawLine(int(cx - 12), int(yc), int(cx - 5), int(yc))
+            p.drawLine(int(cx + 5), int(yc), int(cx + 12), int(yc))
 
         # Lower handle
-        p.setPen(QPen(rim_col, 1.4))
+        p.setPen(QPen(rim_col, 1.3))
         p.setBrush(lo_col)
-        p.drawRoundedRect(QRectF(cx - 9.0, y_lo - 5.0, 18.0, 10.0), 4.0, 4.0)
+        p.drawRoundedRect(QRectF(cx - 9.0, y_lo - 4.5, 18.0, 9.0), 4.5, 4.5)
 
-        # Upper handle (bright AlveoSlicer yellow)
-        p.setPen(QPen(rim_col, 1.5))
-        p.setBrush(accent_col)
-        p.drawRoundedRect(QRectF(cx - 11.0, y_hi - 6.0, 22.0, 12.0), 4.0, 4.0)
+        # Upper handle (glacial teal, or indigo highlight when parked on a UV cure layer)
+        on_cure = self._high in self._cure_layers
+        p.setPen(QPen(rim_col, 1.4))
+        p.setBrush(cure_col if on_cure else accent_col)
+        p.drawRoundedRect(QRectF(cx - 11.0, y_hi - 5.5, 22.0, 11.0), 5.0, 5.0)
         p.end()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -184,13 +188,13 @@ class LayerRangeBar(QFrame):
         """Construct the layer readouts, reserved-space UV CURE badge, track, and buttons."""
         super().__init__(parent)
         self.setObjectName("floatingCard")
-        self.setFixedWidth(96)
+        self.setFixedWidth(98)
 
         self._layer_zs: List[float] = []
         self._cure_layers: List[int] = []
 
         vbox = QVBoxLayout(self)
-        vbox.setContentsMargins(6, 8, 6, 8)
+        vbox.setContentsMargins(7, 8, 7, 8)
         vbox.setSpacing(5)
 
         self.lbl_top = QLabel("L 0 / 0")
@@ -199,13 +203,13 @@ class LayerRangeBar(QFrame):
         vbox.addWidget(self.lbl_top)
 
         self.lbl_z = QLabel("Z 0.00 mm")
-        self.lbl_z.setObjectName("mutedLabel")
+        self.lbl_z.setObjectName("monoValue")
         self.lbl_z.setAlignment(Qt.AlignmentFlag.AlignCenter)
         vbox.addWidget(self.lbl_z)
 
         # Reserve fixed vertical space even when hidden so the slider never jitters on cure layers
         self.lbl_cure = QLabel("UV CURE")
-        self.lbl_cure.setObjectName("modeBannerFFF")
+        self.lbl_cure.setObjectName("uvBadge")
         self.lbl_cure.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_cure.setFixedHeight(26)
         cure_sp = self.lbl_cure.sizePolicy()

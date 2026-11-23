@@ -44,7 +44,7 @@ def _draw_hex_watermark(painter: QPainter, card: QRectF, radius: float) -> None:
         clip_path.addRect(card)
     painter.setClipPath(clip_path)
 
-    painter.setPen(QPen(QColor(245, 197, 24, 20), 1.2))
+    painter.setPen(QPen(QColor(245, 184, 46, 22), 1.2))
     painter.setBrush(Qt.BrushStyle.NoBrush)
 
     r = 26.0
@@ -92,13 +92,13 @@ def _paint_static_card(
             painter.setBrush(QColor(0, 0, 0, alpha))
             painter.drawRoundedRect(s_rect, 16.0, 16.0)
 
-    # Card body gradient
+    # Card body gradient (Optical flint)
     bg_grad = QLinearGradient(card.topLeft(), card.bottomRight())
-    bg_grad.setColorAt(0.0, QColor("#1c2028"))
-    bg_grad.setColorAt(0.55, QColor("#15181f"))
-    bg_grad.setColorAt(1.0, QColor("#101218"))
+    bg_grad.setColorAt(0.0, QColor("#151c25"))
+    bg_grad.setColorAt(0.55, QColor("#0f141b"))
+    bg_grad.setColorAt(1.0, QColor("#090c10"))
     painter.setBrush(bg_grad)
-    painter.setPen(QPen(QColor("#2c3240"), 1.2))
+    painter.setPen(QPen(QColor("#243040"), 1.2))
     if rounded:
         painter.drawRoundedRect(card, corner_r, corner_r)
     else:
@@ -107,25 +107,25 @@ def _paint_static_card(
     # Subtle honeycomb watermark on right edge
     _draw_hex_watermark(painter, card, corner_r)
 
-    # Warm gold accent top hairline
+    # Amber-gold to UV-indigo optical top hairline
     top_grad = QLinearGradient(card.left() + 24.0, card.top(), card.right() - 24.0, card.top())
-    top_grad.setColorAt(0.0, QColor(245, 197, 24, 0))
-    top_grad.setColorAt(0.35, QColor(245, 197, 24, 210))
-    top_grad.setColorAt(0.75, QColor(245, 197, 24, 140))
-    top_grad.setColorAt(1.0, QColor(245, 197, 24, 0))
+    top_grad.setColorAt(0.0, QColor(245, 184, 46, 0))
+    top_grad.setColorAt(0.35, QColor(245, 184, 46, 220))
+    top_grad.setColorAt(0.75, QColor(129, 140, 248, 175))
+    top_grad.setColorAt(1.0, QColor(129, 140, 248, 0))
     painter.setPen(QPen(top_grad, 2.0))
     painter.drawLine(
         QPointF(card.left() + 22.0, card.top() + 1.0),
         QPointF(card.right() - 22.0, card.top() + 1.0),
     )
 
-    # Soft golden radial glow behind logo
+    # Soft amber-gold radial glow behind logo
     logo_cx = card.left() + 104.0
     logo_cy = card.top() + 124.0
     glow = QRadialGradient(QPointF(logo_cx, logo_cy), 86.0)
-    glow.setColorAt(0.0, QColor(245, 197, 24, 52))
-    glow.setColorAt(0.55, QColor(245, 197, 24, 16))
-    glow.setColorAt(1.0, QColor(245, 197, 24, 0))
+    glow.setColorAt(0.0, QColor(245, 184, 46, 52))
+    glow.setColorAt(0.55, QColor(245, 184, 46, 16))
+    glow.setColorAt(1.0, QColor(245, 184, 46, 0))
     painter.setPen(Qt.PenStyle.NoPen)
     painter.setBrush(glow)
     painter.drawEllipse(QPointF(logo_cx, logo_cy), 86.0, 86.0)
@@ -156,15 +156,15 @@ def _paint_static_card(
     alveo_txt = "Alveo"
     slicer_txt = "Slicer"
     title_y = int(card.top() + 112.0)
-    painter.setPen(QColor("#f4f6fa"))
+    painter.setPen(QColor("#e8eef5"))
     painter.drawText(int(text_x), title_y, alveo_txt)
-    painter.setPen(QColor("#f5c518"))
+    painter.setPen(QColor("#f5b82e"))
     painter.drawText(int(text_x + fm_title.horizontalAdvance(alveo_txt)), title_y, slicer_txt)
 
     sub_font = QFont("Segoe UI")
     sub_font.setPixelSize(14)
     painter.setFont(sub_font)
-    painter.setPen(QColor("#9aa4b4"))
+    painter.setPen(QColor("#8fa0b5"))
     painter.drawText(int(text_x + 1.0), int(card.top() + 140.0), "Hybrid FFF + Photopolymer Slicer")
 
     # Version pill badge
@@ -177,10 +177,10 @@ def _paint_static_card(
     pill_w = fm_ver.horizontalAdvance(ver_label) + 22.0
     pill_h = 25.0
     pill_rect = QRectF(text_x + 1.0, card.top() + 158.0, pill_w, pill_h)
-    painter.setBrush(QColor(245, 197, 24, 28))
-    painter.setPen(QPen(QColor(245, 197, 24, 115), 1.0))
+    painter.setBrush(QColor(245, 184, 46, 28))
+    painter.setPen(QPen(QColor(245, 184, 46, 118), 1.0))
     painter.drawRoundedRect(pill_rect, 7.0, 7.0)
-    painter.setPen(QColor("#f7d24b"))
+    painter.setPen(QColor("#fbc950"))
     painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, ver_label)
 
     # Footer divider line
@@ -307,7 +307,7 @@ class AlveoSplashScreen(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawEllipse(spin_rect)
 
-        arc_pen = QPen(QColor("#f5c518"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        arc_pen = QPen(QColor("#f5b82e"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
         painter.setPen(arc_pen)
         start_16 = int((90.0 - self._angle_deg) * 16.0)
         painter.drawArc(spin_rect, start_16, -105 * 16)
@@ -333,7 +333,7 @@ def render_boot_splash_png(out_path: Path, version: str = __version__) -> Path:
     """
     w, h = AlveoSplashScreen._CARD_W, AlveoSplashScreen._CARD_H
     img = QImage(w, h, QImage.Format.Format_ARGB32)
-    img.fill(QColor("#15181f"))
+    img.fill(QColor("#0f141b"))
 
     logo_path = get_logo_path()
     logo = QPixmap(str(logo_path)) if logo_path is not None else QPixmap()
@@ -352,7 +352,7 @@ def render_boot_splash_png(out_path: Path, version: str = __version__) -> Path:
     painter.setPen(QPen(QColor(255, 255, 255, 26), 2.4))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawEllipse(spin_rect)
-    painter.setPen(QPen(QColor("#f5c518"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.setPen(QPen(QColor("#f5b82e"), 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
     painter.drawArc(spin_rect, 90 * 16, -105 * 16)
 
     status_font = QFont("Segoe UI")

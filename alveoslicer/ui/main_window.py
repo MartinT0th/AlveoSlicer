@@ -9,7 +9,7 @@ switcher, and background :class:`SliceWorker`.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import trimesh
@@ -17,6 +17,7 @@ from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QInputDialog,
     QMainWindow,
@@ -48,12 +49,15 @@ from .settings import (
     build_resin_settings_tab,
 )
 from .styling import (
+    EXPERIENCE_MODES,
     THEME_MODES,
     build_stylesheet,
     get_palette,
+    load_experience_mode,
     load_theme_preference,
     make_icon,
     resolve_theme_mode,
+    save_experience_mode,
     save_theme_preference,
 )
 from .views import ConsoleGCodeView, CureScheduleView
@@ -78,18 +82,24 @@ class AlveoSlicerWindow(QMainWindow):
 
         self.theme_mode: str = load_theme_preference()
         self.resolved_theme: str = resolve_theme_mode(self.theme_mode)
+        self.experience_mode: str = load_experience_mode()
         self._theme_buttons: Dict[str, QPushButton] = {}
         self._theme_actions: Dict[str, QAction] = {}
+        self._mode_buttons: Dict[str, QPushButton] = {}
+        self._mode_actions: Dict[str, QAction] = {}
         self._tab_icon_names: Dict[int, str] = {}
 
         # Slicing worker & multi-plate queue state
         self.worker: Optional[SliceWorker] = None
         self._slicing_plate_idx: int = 0
         self._slice_queue: List[int] = []
+        self._syncing_mode: bool = False
+        self._last_hybrid_state: Optional[bool] = None
 
         self._build_ui()
         self._build_menu_bar()
         self._init_presets_and_config()
+        self.set_experience_mode(self.experience_mode, save=False)
         self.set_theme_mode(self.theme_mode, save=False)
 
         # Follow OS live Dark/Light changes when set to System mode
@@ -179,14 +189,39 @@ class AlveoSlicerWindow(QMainWindow):
         sched_log.addWidget(self.console_view)
         sched_log.setSizes([380, 420])
         sched_idx = self.tabs.addTab(sched_log, "Schedule && Log")
+        self._sched_tab_idx: int = sched_idx
         self._tab_icon_names[sched_idx] = "gcode"
         self.tabs.setIconSize(QSize(15, 15))
 
-        # Top-Right Theme Switcher (Dark / Light / System)
-        theme_bar = QWidget()
-        tb_row = QHBoxLayout(theme_bar)
-        tb_row.setContentsMargins(6, 4, 10, 4)
-        tb_row.setSpacing(3)
+        # Top-Right Controls: Simple/Advanced Pill + Dark/Light/System Theme Pill
+        corner_bar = QWidget()
+        cb_row = QHBoxLayout(corner_bar)
+        cb_row.setContentsMargins(6, 3, 10, 3)
+        cb_row.setSpacing(8)
+
+        mode_pill = QFrame()
+        mode_pill.setObjectName("segmentedPill")
+        mp_row = QHBoxLayout(mode_pill)
+        mp_row.setContentsMargins(2, 2, 2, 2)
+        mp_row.setSpacing(2)
+        for m_key, m_label, m_tip in (
+            ("simple", "Simple", "Show essential settings for quick day-to-day slicing"),
+            ("advanced", "Advanced", "Show all calibration, hardware, and DP scheduler settings"),
+        ):
+            btn = QPushButton(m_label)
+            btn.setObjectName("modeBtn")
+            btn.setCheckable(True)
+            btn.setToolTip(m_tip)
+            btn.clicked.connect(lambda _c=False, m=m_key: self.set_experience_mode(m))
+            mp_row.addWidget(btn)
+            self._mode_buttons[m_key] = btn
+        cb_row.addWidget(mode_pill)
+
+        theme_pill = QFrame()
+        theme_pill.setObjectName("segmentedPill")
+        tb_row = QHBoxLayout(theme_pill)
+        tb_row.setContentsMargins(2, 2, 2, 2)
+        tb_row.setSpacing(2)
         for mode_key, label, tip in (
             ("dark", "Dark", "Switch to Dark Mode"),
             ("light", "Light", "Switch to Light Mode"),
@@ -196,11 +231,13 @@ class AlveoSlicerWindow(QMainWindow):
             btn.setObjectName("themeBtn")
             btn.setCheckable(True)
             btn.setToolTip(tip)
-            btn.setIconSize(QSize(14, 14))
+            btn.setIconSize(QSize(13, 13))
             btn.clicked.connect(lambda _c=False, m=mode_key: self.set_theme_mode(m))
             tb_row.addWidget(btn)
             self._theme_buttons[mode_key] = btn
-        self.tabs.setCornerWidget(theme_bar, Qt.Corner.TopRightCorner)
+        cb_row.addWidget(theme_pill)
+
+        self.tabs.setCornerWidget(corner_bar, Qt.Corner.TopRightCorner)
         root.addWidget(self.tabs)
 
     def _connect_plater_signals(self) -> None:
@@ -311,6 +348,15 @@ class AlveoSlicerWindow(QMainWindow):
             theme_grp.addAction(act)
             self._theme_actions[mode_key] = act
 
+        m_exp = m_view.addMenu("Settings Mode")
+        exp_grp = QActionGroup(self)
+        exp_grp.setExclusive(True)
+        for exp_key, label in (("simple", "Simple"), ("advanced", "Advanced")):
+            act = _add_act(m_exp, label, lambda _checked=False, m=exp_key: self.set_experience_mode(m))
+            act.setCheckable(True)
+            exp_grp.addAction(act)
+            self._mode_actions[exp_key] = act
+
         m_view.addSeparator()
         for label, key in (
             ("Camera: Isometric", "iso"),
@@ -326,6 +372,23 @@ class AlveoSlicerWindow(QMainWindow):
     # Theme Switching (Dark / Light / System)
     # -------------------------------------------------------------------------
 
+    def set_experience_mode(self, mode: str, save: bool = True) -> None:
+        """Switch settings tabs between ``simple`` and ``advanced`` complexity levels."""
+        m = mode.strip().lower() if mode and mode.strip().lower() in EXPERIENCE_MODES else "simple"
+        self.experience_mode = m
+        if save:
+            save_experience_mode(m)
+        for tab in self.settings_tabs.values():
+            tab.set_experience_mode(m)
+        for key, btn in self._mode_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(key == m)
+            btn.blockSignals(False)
+        for key, act in self._mode_actions.items():
+            act.blockSignals(True)
+            act.setChecked(key == m)
+            act.blockSignals(False)
+
     def set_theme_mode(self, mode: str, save: bool = True) -> None:
         """Apply ``dark``, ``light``, or ``system`` UI theme across window, viewport, and icons."""
         m = mode.strip().lower() if mode and mode.strip().lower() in THEME_MODES else "dark"
@@ -338,6 +401,8 @@ class AlveoSlicerWindow(QMainWindow):
         pal = get_palette(self.resolved_theme)
 
         self.plater.apply_theme(self.resolved_theme)
+        if hasattr(self.schedule_view, "apply_theme"):
+            self.schedule_view.apply_theme(self.resolved_theme)
         for tab in self.settings_tabs.values():
             tab.apply_theme(self.resolved_theme)
 
@@ -378,13 +443,77 @@ class AlveoSlicerWindow(QMainWindow):
             self.plater.refresh_preset_dropdown(cat, default_name, is_modified=False)
         self._sync_bed_and_mode()
 
+    @staticmethod
+    def _is_fff_only_print_preset(preset: Any) -> bool:
+        """Return ``True`` for user presets or built-in Standard FFF-only print presets."""
+        if not getattr(preset, "builtin", False):
+            return True
+        vals = getattr(preset, "values", {})
+        return (
+            not bool(vals.get("hybrid.enable_resin_pumping", True))
+            and not bool(vals.get("hybrid.enable_uv_curing", True))
+            and str(vals.get("infill.infill_engine", "surface_normal_3d")) == "standard"
+        )
+
     def _sync_bed_and_mode(self) -> None:
-        """Sync bed dimensions, hybrid/FFF banner badge, material densities, and wipe tower."""
-        p = self.cfg.printer
-        self.plater.viewport.set_bed_size(p.bed_size_x, p.bed_size_y, p.bed_size_z, bed_shape=p.bed_shape)
-        self.plater.update_mode_badge(self.cfg)
-        self.plater.update_material_properties(self.cfg)
-        self._sync_wipe_tower_preview()
+        """Sync bed dimensions, Hybrid vs FFF-only capability visibility, presets, and wipe tower."""
+        if self._syncing_mode:
+            return
+        self._syncing_mode = True
+        try:
+            is_hybrid = self.cfg.is_hybrid_printer
+            if self._last_hybrid_state != is_hybrid:
+                self._last_hybrid_state = is_hybrid
+                resin_idx = self._category_tab_indices.get("resin")
+                if resin_idx is not None:
+                    if (not is_hybrid) and self.tabs.currentIndex() == resin_idx:
+                        self.tabs.setCurrentIndex(0)
+                    self.tabs.setTabVisible(resin_idx, is_hybrid)
+
+                self.schedule_view.setVisible(is_hybrid)
+                self.tabs.setTabText(self._sched_tab_idx, "Schedule && Log" if is_hybrid else "Log && G-Code")
+                for tab in self.settings_tabs.values():
+                    tab.set_hybrid_enabled(is_hybrid)
+                self.plater.set_hybrid_mode(is_hybrid)
+
+                print_tab = self.settings_tabs["print"]
+                if not is_hybrid:
+                    pred = self._is_fff_only_print_preset
+                    cur_pname = print_tab.active_preset_name
+                    cur_preset = self.preset_manager.get_preset("print", cur_pname)
+                    switched = False
+                    if cur_preset is None or not pred(cur_preset):
+                        fallback = "0.20mm STANDARD FFF (Gyroid 15%, No Resin/UV)"
+                        if self.preset_manager.get_preset("print", fallback) is not None:
+                            self.preset_manager.apply_preset(self.cfg, "print", fallback)
+                            cur_pname = fallback
+                            switched = True
+                    print_tab.set_preset_filter(pred, select_name=cur_pname)
+                    if switched:
+                        print_tab.load_from_config(self.cfg)
+                    self.plater.set_preset_filter("print", pred)
+                    self.plater.refresh_preset_dropdown(
+                        "print",
+                        cur_pname,
+                        is_modified=self.preset_manager.is_modified(self.cfg, "print", cur_pname),
+                    )
+                else:
+                    cur_pname = print_tab.active_preset_name
+                    print_tab.set_preset_filter(None, select_name=cur_pname)
+                    self.plater.set_preset_filter("print", None)
+                    self.plater.refresh_preset_dropdown(
+                        "print",
+                        cur_pname,
+                        is_modified=self.preset_manager.is_modified(self.cfg, "print", cur_pname),
+                    )
+
+            p = self.cfg.printer
+            self.plater.viewport.set_bed_size(p.bed_size_x, p.bed_size_y, p.bed_size_z, bed_shape=p.bed_shape)
+            self.plater.update_mode_badge(self.cfg)
+            self.plater.update_material_properties(self.cfg)
+            self._sync_wipe_tower_preview()
+        finally:
+            self._syncing_mode = False
 
     def _sync_wipe_tower_preview(self) -> None:
         """Update the 3D wipe tower footprint/height box from active FFF settings and model Z."""
@@ -434,6 +563,8 @@ class AlveoSlicerWindow(QMainWindow):
 
     def _switch_plater_view(self, mode: str) -> None:
         """Activate the Plater tab and switch its view mode (``editor``/``preview``/``basins``)."""
+        if mode == "basins" and not self.cfg.is_hybrid_printer:
+            return
         self.tabs.setCurrentIndex(0)
         self.plater.set_view_mode(mode)
 
@@ -874,9 +1005,9 @@ class AlveoSlicerWindow(QMainWindow):
         plate = self.scene.plates[self._slicing_plate_idx]
         plate.slice_result = res
         plate.gcode_text = res.gcode_text
-        plate.preview_data = parse_gcode(res.gcode_text)
+        plate.preview_data = getattr(res, "_preview_data", None) or parse_gcode(res.gcode_text)
 
-        mode_txt = "Standard FFF" if self.cfg.hybrid.is_fff_only else "Hybrid"
+        mode_txt = "Standard FFF" if self.cfg.effective_is_fff_only else "Hybrid"
         self.console_view.append_log(
             f"--- {plate.name} COMPLETE ({mode_txt}) | {len(res.layers)} layers, "
             f"{len(res.schedule)} cure cycles, {res.total_resin_ml:.2f} mL resin, "

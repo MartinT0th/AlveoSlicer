@@ -34,11 +34,11 @@ class CureScheduleView(QWidget):
         self._slice_result: Optional[SliceResult] = None
 
         vbox = QVBoxLayout(self)
+        vbox.setContentsMargins(10, 10, 10, 6)
+        vbox.setSpacing(8)
 
         self.lbl_summary = QLabel("No slice summary yet.")
-        self.lbl_summary.setStyleSheet(
-            "background-color: #111215; padding: 8px 10px; border-radius: 4px; font-weight: 600;"
-        )
+        self.lbl_summary.setObjectName("summaryBanner")
         vbox.addWidget(self.lbl_summary)
 
         self.tbl_schedule = QTableWidget(0, 8)
@@ -57,6 +57,7 @@ class CureScheduleView(QWidget):
         self.tbl_schedule.setAlternatingRowColors(True)
         self.tbl_schedule.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tbl_schedule.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_schedule.verticalHeader().setVisible(False)
         self.tbl_schedule.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.tbl_schedule.cellClicked.connect(self._on_row_clicked)
         vbox.addWidget(self.tbl_schedule, stretch=1)
@@ -64,6 +65,12 @@ class CureScheduleView(QWidget):
         hint = QLabel("Click any row to jump directly to that cure layer in the Plater G-Code Previewer.")
         hint.setObjectName("mutedLabel")
         vbox.addWidget(hint)
+
+    def apply_theme(self, resolved_mode: str) -> None:
+        """Refresh widget polish when the active application theme changes."""
+        del resolved_mode
+        self.lbl_summary.style().unpolish(self.lbl_summary)
+        self.lbl_summary.style().polish(self.lbl_summary)
 
     def populate(self, res: SliceResult) -> None:
         """Populate the summary banner and schedule table rows from ``res``."""

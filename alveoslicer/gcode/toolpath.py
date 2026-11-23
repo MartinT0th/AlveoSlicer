@@ -3,26 +3,38 @@
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import shapely
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 
 from ..core.config import SlicerConfig
-from ..core.geometry import clean_geom, extract_polylines, iter_polygons, safe_buffer, safe_intersection
+from ..core.geometry import (
+    clean_geom,
+    extract_polylines,
+    iter_polygons,
+    safe_buffer,
+    safe_difference,
+    safe_intersection,
+)
+from ..infill.standard import hatch_polygon
 from ..slicing.layer import SlicedLayer
 
 PRUSA_TYPE_MAP = {
     "SKIRT_BRIM": "Skirt/Brim",
     "WIPE_TOWER": "Wipe tower",
     "SHELL_EXT_PERIM": "External perimeter",
+    "OVERHANG_PERIM": "External perimeter",
     "SHELL_PERIM": "Perimeter",
     "SHELL_HOLE": "Perimeter",
+    "THIN_WALL": "Perimeter",
     "SHELL_FILL": "Solid infill",
+    "BRIDGE": "Solid infill",
     "SHELL_TOP_FILL": "Top solid infill",
     "SHELL_IRONING": "Ironing",
     "INSIDE_PERIM": "Internal infill",
+    "GAP_FILL": "Internal infill",
     "CELL_CAP_PERIM": "Solid infill",
     "CELL_CAP_HOLE": "Solid infill",
     "CELL_CAP_FILL": "Solid infill",
@@ -112,14 +124,35 @@ def _emit_vector_region(
     fuzzy_point_dist_mm: float = 0.8,
     fuzzy_thickness_mm: float = 0.3,
     solid_fill_pattern: str = "monotonic",
+    detect_thin_walls: bool = False,
+    gap_fill_enabled: bool = True,
+    exclude_bridge_region: Optional[shapely.Geometry] = None,
 ) -> None:
     """Convert a 2D Shapely polygon region into concentric perimeter loops and monotonic solid infill lines."""
     if region is None or region.is_empty:
         return
 
+    clean_reg = clean_geom(region)
     perim_rings: List[Tuple[str, List[np.ndarray]]] = []
-    cur = safe_buffer(clean_geom(region), -0.5 * lw_ext, join_style=2)
+    cur = safe_buffer(clean_reg, -0.5 * lw_ext, join_style=2)
+    if cur.is_empty and tag == "SHELL" and num_perims == 1 and not clean_reg.is_empty:
+        # 1-perimeter annular shell strips collapse when width == lw_ext; trace filled exterior directly
+        ext_polys = [Polygon(p.exterior) for p in iter_polygons(clean_reg)]
+        if ext_polys:
+            cur = safe_buffer(clean_geom(shapely.unary_union(ext_polys)), -0.5 * lw_ext, join_style=2)
     overlap_factor = max(0.50, min(1.0, 1.0 - (infill_overlap_pct / 100.0) * 0.5))
+
+    # Thin-wall detection: extract center-pass strokes for webs narrower than 1.2 * lw_ext
+    if detect_thin_walls and tag == "SHELL":
+        thick_core = safe_buffer(safe_buffer(clean_reg, -0.60 * lw_ext, join_style=2), 0.60 * lw_ext, join_style=2)
+        thin_strips = safe_difference(clean_reg, thick_core) if not thick_core.is_empty else clean_reg
+        if not thin_strips.is_empty and thin_strips.area > 0.12 * lw_ext:
+            thin_core = safe_buffer(thin_strips, -0.22 * lw_ext, join_style=2)
+            for poly in iter_polygons(thin_core, min_area=0.04):
+                ext_c = np.asarray(poly.exterior.coords, dtype=np.float64)
+                if len(ext_c) >= 3:
+                    mid = max(2, len(ext_c) // 2)
+                    paths.append(("THIN_WALL", ext_c[:mid]))
 
     for p_i in range(max(1, num_perims)):
         if cur.is_empty:
@@ -127,7 +160,7 @@ def _emit_vector_region(
         is_ext = tag == "SHELL" and p_i == 0
         ext_tag = f"{tag}_EXT_PERIM" if is_ext else f"{tag}_PERIM"
         apply_fuzzy_ext = tag == "SHELL" and (
-            (fuzzy_mode == "outside_walls" and is_ext) or (fuzzy_mode == "all_walls")
+            (fuzzy_mode in ("outside_walls", "outside") and is_ext) or (fuzzy_mode == "all_walls")
         )
         apply_fuzzy_hole = tag == "SHELL" and (fuzzy_mode == "all_walls")
 
@@ -156,6 +189,9 @@ def _emit_vector_region(
     for r_tag, loops in perim_rings:
         for lp in loops:
             paths.append((r_tag, lp))
+
+    if exclude_bridge_region is not None and not exclude_bridge_region.is_empty and not cur.is_empty:
+        cur = safe_difference(cur, exclude_bridge_region)
 
     if not cur.is_empty and cur.area > lw_fill * lw_fill:
         fill_tag = fill_tag_override or f"{tag}_FILL"
@@ -192,23 +228,15 @@ def _emit_vector_region(
                     paths.append((fill_tag, coords))
                 r += lw_fill
         else:
-            rot = clean_geom(shapely.affinity.rotate(cur, -fill_angle_deg, origin=(0.0, 0.0)))
-            if rot.is_empty:
-                return
-            minx, miny, maxx, maxy = rot.bounds
-            y_val = miny + 0.5 * lw_fill
-            flip = False
             monotonic = pat in ("monotonic", "monotonic_lines")
-            while y_val <= maxy:
-                seg = LineString([(minx - 1.0, y_val), (maxx + 1.0, y_val)])
-                inter = safe_intersection(rot, seg)
-                for coords in extract_polylines(inter):
-                    if (not monotonic) and flip:
-                        coords = coords[::-1]
-                    unrot = shapely.affinity.rotate(LineString(coords), fill_angle_deg, origin=(0.0, 0.0))
-                    paths.append((fill_tag, np.asarray(unrot.coords)))
-                y_val += lw_fill
-                flip = not flip
+            for coords in hatch_polygon(
+                cur, lw_fill, fill_angle_deg, alternating=not monotonic, min_area=0.0
+            ):
+                paths.append((fill_tag, coords))
+    elif gap_fill_enabled and not cur.is_empty and cur.area > 0.18 * lw_fill * lw_fill:
+        # Sliver gap fill between inner perimeters
+        for coords in hatch_polygon(cur, max(0.25, lw_fill * 0.85), fill_angle_deg, alternating=True, min_area=0.02):
+            paths.append(("GAP_FILL", coords))
 
 
 def _emit_ironing_pass(
@@ -225,23 +253,10 @@ def _emit_ironing_pass(
     if iron_area.is_empty or iron_area.area < 0.25:
         return
 
-    step = max(0.05, float(spacing_mm))
-    rot = clean_geom(shapely.affinity.rotate(iron_area, -angle_deg, origin=(0.0, 0.0)))
-    if rot.is_empty:
-        return
-    minx, miny, maxx, maxy = rot.bounds
-    y_val = miny + 0.5 * step
-    flip = False
-    while y_val <= maxy:
-        seg = LineString([(minx - 1.0, y_val), (maxx + 1.0, y_val)])
-        inter = safe_intersection(rot, seg)
-        for coords in extract_polylines(inter):
-            if flip:
-                coords = coords[::-1]
-            unrot = shapely.affinity.rotate(LineString(coords), angle_deg, origin=(0.0, 0.0))
-            paths.append(("SHELL_IRONING", np.asarray(unrot.coords)))
-        y_val += step
-        flip = not flip
+    for coords in hatch_polygon(
+        iron_area, max(0.05, float(spacing_mm)), angle_deg, alternating=True, min_area=0.0
+    ):
+        paths.append(("SHELL_IRONING", coords))
 
 
 def generate_fff_paths_for_layer(
@@ -289,26 +304,47 @@ def generate_fff_paths_for_layer(
         else (cfg.infill.bottom_fill_pattern if is_first else "monotonic")
     )
     eff_perims = 1 if f.spiral_vase else f.perimeters
-    _emit_vector_region(
-        layer.shell_geom,
-        "SHELL",
-        eff_perims,
-        angle,
-        lw_ext=lw_ext,
-        lw_perim=lw_perim,
-        lw_fill=lw_solid,
-        paths=paths,
-        external_first=f.external_perimeters_first,
-        seam_mode=f.seam_position,
-        layer_idx=layer.layer_idx,
-        bed_y=cfg.printer.bed_size_y,
-        fill_tag_override=fill_override,
-        infill_overlap_pct=f.infill_overlap_pct,
-        fuzzy_mode=f.fuzzy_skin_mode,
-        fuzzy_point_dist_mm=f.fuzzy_skin_point_dist_mm,
-        fuzzy_thickness_mm=f.fuzzy_skin_thickness_mm,
-        solid_fill_pattern=solid_pat,
-    )
+    bridge_reg = getattr(layer, "bridge_geom", None)
+    if f.spiral_vase and layer.layer_idx > max(1, int(f.bottom_solid_layers)):
+        vase_reg = safe_buffer(clean_geom(layer.outer_geom), -0.5 * lw_ext, join_style=2)
+        for poly in iter_polygons(vase_reg):
+            c_ext = _align_loop_seam(
+                np.asarray(poly.exterior.coords), f.seam_position, layer.layer_idx, cfg.printer.bed_size_y
+            )
+            paths.append(("SHELL_EXT_PERIM", c_ext))
+    else:
+        _emit_vector_region(
+            layer.shell_geom,
+            "SHELL",
+            eff_perims,
+            angle,
+            lw_ext=lw_ext,
+            lw_perim=lw_perim,
+            lw_fill=lw_solid,
+            paths=paths,
+            external_first=f.external_perimeters_first,
+            seam_mode=f.seam_position,
+            layer_idx=layer.layer_idx,
+            bed_y=cfg.printer.bed_size_y,
+            fill_tag_override=fill_override,
+            infill_overlap_pct=f.infill_overlap_pct,
+            fuzzy_mode=f.fuzzy_skin_mode,
+            fuzzy_point_dist_mm=f.fuzzy_skin_point_dist_mm,
+            fuzzy_thickness_mm=f.fuzzy_skin_thickness_mm,
+            solid_fill_pattern=solid_pat,
+            detect_thin_walls=bool(f.detect_thin_walls),
+            gap_fill_enabled=True,
+            exclude_bridge_region=bridge_reg,
+        )
+
+    # 1b. Unsupported Bridge Skins (printed with dedicated bridge angle, flow ratio, speed, and fan boost)
+    if bridge_reg is not None and not bridge_reg.is_empty and not f.spiral_vase:
+        b_ang = float(cfg.infill.bridge_angle_deg)
+        if abs(b_ang) <= 1e-4:
+            bx0, by0, bx1, by1 = bridge_reg.bounds
+            b_ang = 0.0 if (bx1 - bx0) <= (by1 - by0) else 90.0
+        for coords in hatch_polygon(bridge_reg, lw_solid, b_ang, alternating=True, min_area=0.05):
+            paths.append(("BRIDGE", coords))
 
     # 2. Anchored cellular / standard internal infill lines
     if not cfg.infill.infill_before_perimeters:
