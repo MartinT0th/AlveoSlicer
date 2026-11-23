@@ -724,7 +724,6 @@ class PlaterView(QWidget):
         self._resin_material_row.setVisible(hyb)
         self.cure_cadence_strip.setVisible(hyb)
         self.btn_mode_basins.setVisible(hyb)
-        self.chk_wireframe.setVisible(hyb)
         for tag in ("Filled resin", "Resin dosing"):
             for w in self._legend_row_widgets.get(tag, []):
                 w.setVisible(hyb)

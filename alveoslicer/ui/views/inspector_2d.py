@@ -110,6 +110,11 @@ class LayerInspector2D(QWidget):
         """Bind a new ``SliceResult`` and render its first cure layer (or middle layer in FFF-only mode)."""
         self._slice_result = res
         n = len(res.layers)
+        if n == 0:
+            self.slider_layer.setEnabled(False)
+            self.sp_layer_idx.setEnabled(False)
+            self.btn_next_cure.setEnabled(False)
+            return
         for w in (self.slider_layer, self.sp_layer_idx):
             w.blockSignals(True)
             w.setRange(1, n)

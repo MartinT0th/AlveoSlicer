@@ -452,7 +452,6 @@ class AlveoSlicerWindow(QMainWindow):
         return (
             not bool(vals.get("hybrid.enable_resin_pumping", True))
             and not bool(vals.get("hybrid.enable_uv_curing", True))
-            and str(vals.get("infill.infill_engine", "surface_normal_3d")) == "standard"
         )
 
     def _sync_bed_and_mode(self) -> None:

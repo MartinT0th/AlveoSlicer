@@ -351,7 +351,7 @@ class GCodeHAL:
         self.emit("; prusaslicer_config = begin")
         infill_pat = (
             self.cfg.infill.standard_fill_pattern
-            if (str(self.cfg.infill.infill_engine).lower() == "standard" or not self.cfg.is_hybrid_printer)
+            if str(self.cfg.infill.infill_engine).lower() == "standard"
             else self.cfg.infill.pattern
         )
         config_pairs = [
@@ -551,16 +551,14 @@ class GCodeHAL:
         self.emit(";BEFORE_LAYER_CHANGE")
         if p.before_layer_gcode and p.before_layer_gcode.strip():
             self._emit_custom_gcode(p.before_layer_gcode, layer_num=layer_idx, layer_z=f"{z_eff:.3f}")
+        self.emit("G92 E0")
+        layer_e = 0.0
         if f.retract_on_layer_change and layer_idx > 1 and not self._retracted and retract_len > 0.0:
             if use_fw_ret:
                 self.emit("G10 ; retract on layer change")
-            elif rel_e:
-                self.emit(f"G1 E-{retract_len:.5f} F{f_ret:.0f} ; retract on layer change")
             else:
-                self.emit(f"G1 E{-retract_len:.5f} F{f_ret:.0f} ; retract on layer change")
+                self.emit(f"G1 E-{retract_len:.5f} F{f_ret:.0f} ; retract on layer change")
             self._retracted = True
-        self.emit("G92 E0")
-        layer_e = 0.0
         self.emit(f";{z_eff:.3f}")
         self.emit(";AFTER_LAYER_CHANGE")
         self.emit(f";{z_eff:.3f}")
@@ -746,7 +744,7 @@ class GCodeHAL:
             for pt in pts[1:]:
                 nx_, ny_ = pt[0], pt[1]
                 seg_len = hypot(nx_ - cur_x, ny_ - cur_y)
-                if seg_len < 1e-4:
+                if seg_len < 5e-3:
                     continue
                 e_val = seg_len * e_per_mm
                 layer_e += e_val

@@ -265,7 +265,7 @@ def generate_standard_infill_layer(
         wavelength = max(lw * 4.0, spacing * 2.05)
         k_w = 2.0 * math.pi / wavelength
         bx0, by0, bx1, by1 = fill_reg.bounds
-        step_g = max(0.35, min(0.95, wavelength / 14.0))
+        step_g = max(0.45, min(1.0, wavelength / 10.0))
         gx_arr = np.arange(bx0 - step_g, bx1 + 2.0 * step_g, step_g)
         gy_arr = np.arange(by0 - step_g, by1 + 2.0 * step_g, step_g)
         if len(gx_arr) >= 3 and len(gy_arr) >= 3:
@@ -276,11 +276,15 @@ def generate_standard_infill_layer(
                 + np.sin(k_w * yy) * math.cos(kz)
                 + math.sin(kz) * np.cos(k_w * xx)
             )
-            raw_contours = [
-                np.column_stack([bx0 - step_g + contour[:, 0] * step_g, by0 - step_g + contour[:, 1] * step_g])
-                for contour in sk_measure.find_contours(g_val, level=0.0)
-                if len(contour) >= 2
-            ]
+            simp_tol = max(0.08, lw * 0.22)
+            raw_contours = []
+            for contour in sk_measure.find_contours(g_val, level=0.0):
+                if len(contour) < 2:
+                    continue
+                pts = np.column_stack([bx0 - step_g + contour[:, 0] * step_g, by0 - step_g + contour[:, 1] * step_g])
+                ls_s = LineString(pts).simplify(simp_tol, preserve_topology=False)
+                if not ls_s.is_empty:
+                    raw_contours.append(ls_s)
             if raw_contours:
                 lines.extend(extract_polylines(safe_intersection(fill_reg, MultiLineString(raw_contours))))
     elif pat == "concentric":

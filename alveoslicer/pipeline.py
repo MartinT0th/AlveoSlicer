@@ -82,7 +82,7 @@ def slice_mesh(
         _log(f"[Scene] Detected {n_bodies} independent solid bodies — synthesizing & slicing each separately.")
 
     body_lattices: List[NormalVoronoiLattice] = []
-    use_standard = (str(cfg.infill.infill_engine).lower() == "standard") or (not cfg.is_hybrid_printer)
+    use_standard = str(cfg.infill.infill_engine).lower() == "standard"
     gen_name = str(getattr(cfg.infill, "slicing_generator", "mesh_direct")).lower()
     if use_standard:
         _progress(22, "Stage 2-3: Preparing Standard PrusaSlicer Infill engine...")

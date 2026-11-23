@@ -28,6 +28,14 @@ _RING_NV = np.array([0.975, 0.51, -0.51, -0.975, -0.975, -0.51, 0.51, 0.975], dt
 _RING_K = np.arange(8, dtype=np.int32)
 _RING_KN = (np.arange(8, dtype=np.int32) + 1) % 8
 
+# 4-vertex lightweight LOD cross-section profile (half vertex memory for huge toolpaths)
+_RING4_U = np.array([0.88, 0.88, -0.88, -0.88], dtype=np.float32)
+_RING4_V = np.array([1.00, -1.00, -1.00, 1.00], dtype=np.float32)
+_RING4_NU = np.array([0.707, 0.707, -0.707, -0.707], dtype=np.float32)
+_RING4_NV = np.array([0.707, -0.707, -0.707, 0.707], dtype=np.float32)
+_RING4_K = np.arange(4, dtype=np.int32)
+_RING4_KN = (np.arange(4, dtype=np.int32) + 1) % 4
+
 
 def mesh_to_lit_buffer(
     mesh: trimesh.Trimesh,
@@ -65,19 +73,32 @@ def build_extrusion_beads(
     heights: np.ndarray,
     type_ids: np.ndarray,
     layers: Optional[np.ndarray] = None,
+    ring_sides: int = 8,
+    emit_caps: bool = True,
+    orig_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Vectorized rounded-obround continuous filament tube builder (PrusaSlicer-style).
 
     Joins continuous extrusion chains (including closed loops) with clamped miter
     cross-sections and emits rounded dome endcaps only at open chain endpoints.
+    Supports ``ring_sides=4`` (24 verts/seg) for large toolpaths or ``ring_sides=8``
+    (48 verts/seg) for normal toolpaths.
 
-    Returns ``(beads (N, 48, 9), caps (M, 24, 9), caps_seg_idx (M,))``.
+    Returns ``(beads (N, sides*6, 9), caps (M, sides*3, 9), caps_seg_idx (M,))``.
     """
+    sides = 4 if ring_sides == 4 else 8
+    verts_per_seg = sides * 6
+    cap_verts = sides * 3
+    if sides == 4:
+        r_u, r_v, r_nu, r_nv, r_k, r_kn = _RING4_U, _RING4_V, _RING4_NU, _RING4_NV, _RING4_K, _RING4_KN
+    else:
+        r_u, r_v, r_nu, r_nv, r_k, r_kn = _RING_U, _RING_V, _RING_NU, _RING_NV, _RING_K, _RING_KN
+
     n = len(p0)
     if n == 0:
         return (
-            np.zeros((0, 48, 9), dtype=np.float32),
-            np.zeros((0, 24, 9), dtype=np.float32),
+            np.zeros((0, verts_per_seg, 9), dtype=np.float32),
+            np.zeros((0, cap_verts, 9), dtype=np.float32),
             np.zeros((0,), dtype=np.int32),
         )
 
@@ -113,6 +134,8 @@ def build_extrusion_beads(
         )
         if layers is not None and len(layers) == n:
             same &= layers[1:] == layers[:-1]
+        if orig_indices is not None and len(orig_indices) == n:
+            same &= orig_indices[1:] == (orig_indices[:-1] + 1)
         conn_prev[1:] = same
 
     conn_next = np.zeros(n, dtype=bool)
@@ -157,39 +180,42 @@ def build_extrusion_beads(
                 conn_prev[cs] = True
                 conn_next[ce] = True
 
-    # Build 8-vertex rings & smooth outward normals
-    u_hw = hw[:, None] * _RING_U[None, :]
-    v_hz = hz[:, None] * _RING_V[None, :]
+    # Build N-vertex rings & smooth outward normals
+    u_hw = hw[:, None] * r_u[None, :]
+    v_hz = hz[:, None] * r_v[None, :]
 
-    r0 = np.empty((n, 8, 3), dtype=np.float32)
+    r0 = np.empty((n, sides, 3), dtype=np.float32)
     r0[:, :, 0] = c0[:, 0:1] + m0x[:, None] * u_hw
     r0[:, :, 1] = c0[:, 1:2] + m0y[:, None] * u_hw
     r0[:, :, 2] = c0[:, 2:3] + v_hz
 
-    r1 = np.empty((n, 8, 3), dtype=np.float32)
+    r1 = np.empty((n, sides, 3), dtype=np.float32)
     r1[:, :, 0] = c1[:, 0:1] + m1x[:, None] * u_hw
     r1[:, :, 1] = c1[:, 1:2] + m1y[:, None] * u_hw
     r1[:, :, 2] = c1[:, 2:3] + v_hz
 
-    n0 = np.empty((n, 8, 3), dtype=np.float32)
-    n0[:, :, 0] = un0x[:, None] * _RING_NU[None, :]
-    n0[:, :, 1] = un0y[:, None] * _RING_NU[None, :]
-    n0[:, :, 2] = _RING_NV[None, :]
+    n0 = np.empty((n, sides, 3), dtype=np.float32)
+    n0[:, :, 0] = un0x[:, None] * r_nu[None, :]
+    n0[:, :, 1] = un0y[:, None] * r_nu[None, :]
+    n0[:, :, 2] = r_nv[None, :]
 
-    n1 = np.empty((n, 8, 3), dtype=np.float32)
-    n1[:, :, 0] = un1x[:, None] * _RING_NU[None, :]
-    n1[:, :, 1] = un1y[:, None] * _RING_NU[None, :]
-    n1[:, :, 2] = _RING_NV[None, :]
+    n1 = np.empty((n, sides, 3), dtype=np.float32)
+    n1[:, :, 0] = un1x[:, None] * r_nu[None, :]
+    n1[:, :, 1] = un1y[:, None] * r_nu[None, :]
+    n1[:, :, 2] = r_nv[None, :]
 
-    out = np.empty((n, 8, 6, 9), dtype=np.float32)
-    out[:, :, 0, 0:3], out[:, :, 0, 3:6] = r0[:, _RING_K, :], n0[:, _RING_K, :]
-    out[:, :, 1, 0:3], out[:, :, 1, 3:6] = r1[:, _RING_K, :], n1[:, _RING_K, :]
-    out[:, :, 2, 0:3], out[:, :, 2, 3:6] = r1[:, _RING_KN, :], n1[:, _RING_KN, :]
-    out[:, :, 3, 0:3], out[:, :, 3, 3:6] = r0[:, _RING_K, :], n0[:, _RING_K, :]
-    out[:, :, 4, 0:3], out[:, :, 4, 3:6] = r1[:, _RING_KN, :], n1[:, _RING_KN, :]
-    out[:, :, 5, 0:3], out[:, :, 5, 3:6] = r0[:, _RING_KN, :], n0[:, _RING_KN, :]
+    out = np.empty((n, sides, 6, 9), dtype=np.float32)
+    out[:, :, 0, 0:3], out[:, :, 0, 3:6] = r0[:, r_k, :], n0[:, r_k, :]
+    out[:, :, 1, 0:3], out[:, :, 1, 3:6] = r1[:, r_k, :], n1[:, r_k, :]
+    out[:, :, 2, 0:3], out[:, :, 2, 3:6] = r1[:, r_kn, :], n1[:, r_kn, :]
+    out[:, :, 3, 0:3], out[:, :, 3, 3:6] = r0[:, r_k, :], n0[:, r_k, :]
+    out[:, :, 4, 0:3], out[:, :, 4, 3:6] = r1[:, r_kn, :], n1[:, r_kn, :]
+    out[:, :, 5, 0:3], out[:, :, 5, 3:6] = r0[:, r_kn, :], n0[:, r_kn, :]
     out[:, :, :, 6:9] = colors[:, None, None, :]
-    beads = out.reshape(n, 48, 9)
+    beads = out.reshape(n, verts_per_seg, 9)
+
+    if not emit_caps:
+        return beads, np.zeros((0, cap_verts, 9), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
     # Rounded dome endcaps at actual open start/end endpoints
     cap_chunks: List[np.ndarray] = []
@@ -202,13 +228,13 @@ def build_extrusion_beads(
         ext = (0.42 * hw[indices])[:, None]
         dv = np.stack([dx[indices], dy[indices], np.zeros(m, dtype=np.float32)], axis=1) * sign
         apex = centers[indices] + dv * ext
-        cb = np.empty((m, 8, 3, 9), dtype=np.float32)
+        cb = np.empty((m, sides, 3, 9), dtype=np.float32)
         cb[:, :, 0, 0:3], cb[:, :, 0, 3:6] = apex[:, None, :], dv[:, None, :]
-        k_a, k_b = (_RING_K, _RING_KN) if sign < 0 else (_RING_KN, _RING_K)
+        k_a, k_b = (r_k, r_kn) if sign < 0 else (r_kn, r_k)
         cb[:, :, 1, 0:3], cb[:, :, 1, 3:6] = rings[indices][:, k_a, :], norms[indices][:, k_a, :]
         cb[:, :, 2, 0:3], cb[:, :, 2, 3:6] = rings[indices][:, k_b, :], norms[indices][:, k_b, :]
         cb[:, :, :, 6:9] = colors[indices][:, None, None, :]
-        cap_chunks.append(cb.reshape(m, 24, 9))
+        cap_chunks.append(cb.reshape(m, cap_verts, 9))
         cap_idx_chunks.append(indices.astype(np.int32))
 
     _emit_caps(np.flatnonzero(~conn_prev), c0, r0, n0, -1.0)
@@ -216,7 +242,7 @@ def build_extrusion_beads(
 
     if cap_chunks:
         return beads, np.concatenate(cap_chunks, axis=0), np.concatenate(cap_idx_chunks, axis=0)
-    return beads, np.zeros((0, 24, 9), dtype=np.float32), np.zeros((0,), dtype=np.int32)
+    return beads, np.zeros((0, cap_verts, 9), dtype=np.float32), np.zeros((0,), dtype=np.int32)
 
 
 def triangulate_resin_layer_slab(

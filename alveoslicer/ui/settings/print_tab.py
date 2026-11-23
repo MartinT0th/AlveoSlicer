@@ -204,7 +204,7 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
 
     def _sync_mode() -> None:
         is_hyb = tab.hybrid_enabled
-        is_std = (not is_hyb) or (cb_engine.currentText() == "standard")
+        is_std = cb_engine.currentText() == "standard"
         g_std.setEnabled(is_std)
         g_pat.setEnabled(not is_std)
         g_geo.setEnabled(not is_std)
@@ -218,11 +218,17 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
                 "Standard PrusaSlicer Infill Active — Uses density-driven sparse infill patterns "
                 "(Gyroid, Grid, Honeycomb, Cubic, Lightning, etc.) without 3D Voronoi formwork."
             )
-        else:
+        elif is_hyb:
             lbl_eng_info.setObjectName("modeBannerHybrid")
             lbl_eng_info.setText(
                 "3D Surface-Normal Cellular Infill Active — Synthesizes surface-conformal cellular "
                 "formwork walls and connected photopolymer resin channels."
+            )
+        else:
+            lbl_eng_info.setObjectName("modeBannerFFF")
+            lbl_eng_info.setText(
+                "3D Surface-Normal Cellular FFF Infill Active — Synthesizes self-supporting 3D "
+                "cellular infill & hollow formwork without photopolymer resin or UV curing."
             )
         lbl_eng_info.style().unpolish(lbl_eng_info)
         lbl_eng_info.style().polish(lbl_eng_info)
@@ -234,7 +240,6 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
         sp_nd.setEnabled((not is_std) and (not is_hollow) and chk_nd.isChecked())
 
     tab.mark_advanced(g_inf_adv)
-    tab.mark_hybrid_only(g_eng, g_pat, g_geo)
     tab.add_post_change_hook(_sync_mode)
     tab.add_section("Infill", make_page_container([g_eng, g_std, g_pat, g_geo, g_inf_adv]), "infill")
 
@@ -328,7 +333,6 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     note_sup.setWordWrap(True)
     fdry.addRow(note_sup)
     tab.mark_advanced(g_dry)
-    tab.mark_hybrid_only(g_dry)
     tab.add_section("Support material", make_page_container([g_sup, g_org, g_dry]), "support")
 
     # ---- 5. Speed & Acceleration ----
@@ -498,7 +502,7 @@ def build_print_settings_tab(preset_manager: PresetManager, cfg: SlicerConfig) -
     note_eng.setObjectName("mutedLabel")
     note_eng.setWordWrap(True)
     fe.addRow(note_eng)
-    tab.mark_hybrid_form_rows(fe, sp_vox, sp_rast)
+    tab.mark_hybrid_form_rows(fe, sp_rast)
     tab.mark_hybrid_only(note_eng)
     tab.add_section("Advanced", make_page_container([g_ew, g_eng2]), "settings", advanced=True)
 

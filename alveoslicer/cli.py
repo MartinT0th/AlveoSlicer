@@ -6,7 +6,14 @@ import argparse
 from pathlib import Path
 from typing import Optional, Sequence
 
-from .core.config import CELL_PATTERNS, INFILL_ENGINES, STANDARD_INFILL_PATTERNS, SlicerConfig
+from .core.config import (
+    CELL_PATTERNS,
+    INFILL_ENGINES,
+    PRINTER_CAPABILITIES,
+    SLICING_GENERATORS,
+    STANDARD_INFILL_PATTERNS,
+    SlicerConfig,
+)
 from .core.geometry import create_test_curved_wall_mesh, create_test_sphere_mesh, load_and_center_mesh
 from .pipeline import run_slicer
 
@@ -22,7 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", type=Path, help="Load slicer/printer settings from JSON")
     parser.add_argument("--dump-default-config", type=Path, help="Write default JSON config and exit")
     parser.add_argument("--printer-type", choices=["bedslinger_prototype", "corexy_toolchanger"])
+    parser.add_argument("--printer-capability", choices=list(PRINTER_CAPABILITIES), help="Hybrid vs FFF-only capability")
     parser.add_argument("--infill-engine", choices=list(INFILL_ENGINES), help="Infill generator engine")
+    parser.add_argument("--generator", choices=list(SLICING_GENERATORS), help="Cellular infill generator")
     parser.add_argument("--infill-mode", choices=["hollow_shell", "full_to_medial"])
     parser.add_argument("--pattern", choices=list(CELL_PATTERNS), help="3D surface-normal cellular pattern")
     parser.add_argument("--standard-pattern", choices=list(STANDARD_INFILL_PATTERNS), help="Standard 2D/3D infill pattern")
@@ -50,8 +59,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     cfg = SlicerConfig.from_json(args.config) if args.config else SlicerConfig()
     if args.printer_type:
         cfg.printer.printer_type = args.printer_type
+    if args.printer_capability:
+        cfg.printer.printer_capability = args.printer_capability
     if args.infill_engine:
         cfg.infill.infill_engine = args.infill_engine
+    if args.generator:
+        cfg.infill.slicing_generator = args.generator
     if args.infill_mode:
         cfg.infill.mode = args.infill_mode
     if args.pattern:

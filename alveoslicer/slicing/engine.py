@@ -464,7 +464,7 @@ def _slice_single_body_layers(
     t_cell_wall = max(lw, 2.0 * cfg.infill.strut_radius)
     n_inside_perims = max(1, int(round(t_cell_wall / lw)))
     fillet_r = max(0.0, cfg.infill.smin_blend_radius)
-    use_standard_infill = (str(cfg.infill.infill_engine).lower() == "standard") or (not cfg.is_hybrid_printer)
+    use_standard_infill = str(cfg.infill.infill_engine).lower() == "standard"
     num_layers = len(layer_heights)
 
     # 1. Exact vector mesh slicing for this body + XY Size, XY Hole & Elephant Foot compensations
@@ -505,6 +505,13 @@ def _slice_single_body_layers(
             p_ef = safe_buffer(p, -f.elephant_foot_compensation_mm, join_style=2)
             if not p_ef.is_empty and p_ef.area > 0.1:
                 p = p_ef
+        if not p.is_empty:
+            try:
+                p_simp = clean_geom(p.simplify(0.015, preserve_topology=True))
+                if not p_simp.is_empty:
+                    p = p_simp
+            except Exception:
+                pass
         outer_polys.append(clean_geom(p))
 
     body_top_layer = max((k for k, p in enumerate(outer_polys) if not p.is_empty), default=-1)

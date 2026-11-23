@@ -290,6 +290,10 @@ class TestHybridPipelineAndGCode(unittest.TestCase):
         res = slice_mesh(bridge_arch, cfg)
         lines = res.gcode_text.splitlines()
         self.assertIn("M82 ; use absolute distances for extrusion", lines)
+        retract_lc_indices = [idx for idx, ln in enumerate(lines) if "; retract on layer change" in ln]
+        self.assertGreater(len(retract_lc_indices), 0)
+        for idx in retract_lc_indices:
+            self.assertEqual(lines[idx - 1], "G92 E0", "M82 must reset E to 0 BEFORE retract_on_layer_change")
         self.assertTrue(any(ln.startswith("M201 ") for ln in lines))
         self.assertTrue(any(ln.startswith("M203 ") for ln in lines))
         self.assertTrue(any(ln.startswith("M205 ") for ln in lines))
@@ -320,13 +324,15 @@ class TestHybridPipelineAndGCode(unittest.TestCase):
         self.assertGreater(len(set(vase_zs)), 20, "Spiral vase must emit smoothly ramping Z coordinates")
 
     def test_fff_only_printer_preset_disables_hybrid_pipeline(self) -> None:
-        """Selecting Prusa MK4S or Bambu Lab X1C forces Standard FFF cleanly without resin/UV."""
+        """Selecting Prusa MK4S or Bambu Lab X1C disables resin/UV while supporting BOTH 3D cellular & Standard FFF."""
         pm = PresetManager()
         cfg = SlicerConfig()
         # Deliberately leave hybrid switches ON in cfg and apply an FFF-only printer
         cfg.hybrid.enable_resin_pumping = True
         cfg.hybrid.enable_uv_curing = True
+        cfg.fff.layer_height = 0.50
         cfg.infill.infill_engine = "surface_normal_3d"
+        cfg.infill.slicing_generator = "mesh_direct"
 
         self.assertTrue(pm.apply_preset(cfg, "printer", "Prusa MK4S (250x210x220)"))
         self.assertFalse(cfg.is_hybrid_printer)
@@ -334,6 +340,8 @@ class TestHybridPipelineAndGCode(unittest.TestCase):
 
         wall = create_test_curved_wall_mesh(cfg)
         res = slice_mesh(wall, cfg)
+        self.assertGreater(len(res.capsules), 10, "3D surface-normal cellular infill must work on FFF-only printers")
+        self.assertTrue(any(len(ly.inside_perimeter_lines) > 0 for ly in res.layers))
         self.assertEqual(len(res.schedule), 0)
         self.assertEqual(res.total_resin_ml, 0.0)
         self.assertNotIn(cfg.printer.tool_resin, res.gcode_text)
@@ -341,6 +349,7 @@ class TestHybridPipelineAndGCode(unittest.TestCase):
         assert_prusaslicer_296_contract(self, res.gcode_text)
 
         self.assertTrue(pm.apply_preset(cfg, "printer", "Bambu Lab X1C (256x256x256)"))
+        cfg.infill.infill_engine = "standard"
         self.assertFalse(cfg.is_hybrid_printer)
         self.assertEqual(cfg.printer.gcode_flavor, "klipper")
         self.assertEqual(cfg.printer.bed_size_x, 256.0)
